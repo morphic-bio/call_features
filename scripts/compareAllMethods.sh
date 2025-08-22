@@ -5,7 +5,7 @@
 # Usage:
 #   ./compareAllMethods.sh
 #
-# This script runs all available methods in testAssignPerturb.sh and creates
+# This script runs all available methods in testCallPerturb.sh and creates
 # a comprehensive comparison table of the results.
 # ---------------------------------------------------------------------------
 
@@ -98,7 +98,7 @@ run_method() {
     echo "   Log file: $log_file" >&2
     
     # Run the method and capture all output
-    if timeout 30m ./scripts/testAssignPerturb.sh "$method" &> "$log_file"; then
+    if timeout 30m ./scripts/testCallPerturb.sh "$method" &> "$log_file"; then
         echo "   ✅ $method completed successfully" >&2
         
         # Extract statistics from the log
@@ -175,9 +175,7 @@ if [[ ${#SUCCESSFUL_METHODS[@]} -gt 0 ]]; then
     echo "" >&2
     echo "  Cell-derived M_min methods:" >&2
     [[ " ${SUCCESSFUL_METHODS[*]} " =~ " simple " ]] && echo "    - simple: Ratio-based threshold (simple and fast)" >&2
-    [[ " ${SUCCESSFUL_METHODS[*]} " =~ " otsu " ]] && echo "    - otsu: Histogram-based (good for bimodal distributions)" >&2
-    [[ " ${SUCCESSFUL_METHODS[*]} " =~ " quantile " ]] && echo "    - quantile: Quantile-based (robust baseline)" >&2
-    [[ " ${SUCCESSFUL_METHODS[*]} " =~ " model3 " ]] && echo "    - model3: 3-component mixture (best for clear A/S/D populations)" >&2
+    [[ " ${SUCCESSFUL_METHODS[*]} " =~ " em-cells " ]] && echo "    - em-cells: EM-cells method (cell-derived M_min)" >&2
 fi
 
 echo "" >&2

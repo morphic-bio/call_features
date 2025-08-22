@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
-# runAssignPerturb.sh – wrapper that runs the perturbation features mode (flex_demux_mtx)
+# runCallPerturb.sh – wrapper that runs the perturbation features mode (flex_demux_mtx)
 #
 # Edit the variables below, then execute:
-#   ./runAssignPerturb.sh
+#   ./runCallPerturb.sh
 # ---------------------------------------------------------------------------
 SC_ID="30_KO_ES"
 
 
-# REQUIRED paths (same as runAssignEM.sh)
+# REQUIRED paths (same as runCallEm.sh)
 MTX_DIR="/storage/gene_features/${SC_ID}"
 STARSOLO_DIR="/mnt/pikachu/storage/MSK-output-2/Alignments/${SC_ID}/star/Solo.out/Gene"
 OUT_PREFIX="/mnt/pikachu/storage/MSK-output-2/Alignments/${SC_ID}/star/features"
@@ -35,7 +35,7 @@ DOUBLET_BALANCE="1" # require 20–80% balance for top2 (default 1)
 # ---------------------------------------------------------
 
 # Build the command
-CMD=(./call_features
+CMD=(./bin/call_features
      --csc
      --use-em
      --em-fixed-disp

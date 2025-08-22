@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
-# testSimpleAssign.sh – test script for simple classification mode
+# testSimpleCall.sh – test script for simple classification mode
 #
 # Usage:
-#   ./testSimpleAssign.sh [min_count] [min_ratio]   # Test simple mode with custom parameters
-#   ./testSimpleAssign.sh                           # Test with defaults (min_count=2, min_ratio=2.0)
+#   ./testSimpleCall.sh [min_count] [min_ratio]   # Test simple mode with custom parameters
+#   ./testSimpleCall.sh                           # Test with defaults (min_count=2, min_ratio=2.0)
 # ---------------------------------------------------------------------------
 
 # Parse arguments or use defaults
@@ -13,7 +13,7 @@ MIN_RATIO=${2:-2.0}    # default: 2.0
 
 SC_ID="30_KO_ES"
 
-# REQUIRED paths (same as runAssignPerturb.sh)
+# REQUIRED paths (same as runCallPerturb.sh)
 MTX_DIR="/storage/gene_features/${SC_ID}"
 STARSOLO_DIR="/mnt/pikachu/storage/MSK-output-2/Alignments/${SC_ID}/star/Solo.out/Gene"
 OUT_PREFIX="/mnt/pikachu/storage/MSK-output-2/Alignments/${SC_ID}/star/features_simple_${MIN_COUNT}_${MIN_RATIO}"
@@ -36,7 +36,7 @@ echo "Logic: top1_count >= min_count AND (top2_count == 0 OR top1/top2 >= min_ra
 echo ""
 
 # Build the command - much simpler than other modes
-CMD=(./call_features
+CMD=(./bin/call_features
      --process-features
      --mtx-dir      "$MTX_DIR"
      --starsolo-dir "$STARSOLO_DIR"

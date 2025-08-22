@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
-# runAssignEM.sh – wrapper that runs the *EM* variant (call_features)
+# runCallEm.sh – wrapper that runs the *EM* variant (call_features)
 #
 # Edit the variables below, then execute:
-#   ./runAssignEM.sh
+#   ./runCallEm.sh
 # ---------------------------------------------------------------------------
-SC_ID="SC2300772"
+SC_ID="SC2300771"
 
 
-# REQUIRED paths (same as runAssign.sh)
-MTX_DIR="/storage/JAX_features/${SC_ID}"
-STARSOLO_DIR="/storage/scRNAseq_output/Alignments/${SC_ID}/star/Solo.out/Gene"
-OUT_PREFIX="/storage/scRNAseq_output/Alignments/${SC_ID}/star/features"
+# REQUIRED paths
+MTX_DIR="/storage/scRNAseq_output/Alignments/${SC_ID}/star/demux"
+OUT_PREFIX="/storage/scRNAseq_output/Alignments/${SC_ID}/star/features/"
+
+# OPTIONAL paths (set to empty string to disable)
+#STARSOLO_DIR="/storage/scRNAseq_output/Alignments/${SC_ID}/star/Solo.out/Gene"
+# Alternative: place filtered_barcodes.tsv in your MTX_DIR instead of using STARsolo
 
 # OPTIONAL Flex parameters (unchanged defaults)
 TAU="0.8"          # --tau
@@ -35,11 +38,10 @@ DOUBLET_BALANCE="1" # require 20–80% balance for top2 (default 1)
 # ---------------------------------------------------------
 
 # Build the command
-CMD=(./call_features
+CMD=(./bin/call_features
       --use-em
       --em-fixed-disp
       --mtx-dir      "$MTX_DIR"
-      --starsolo-dir "$STARSOLO_DIR"
       --out-prefix   "$OUT_PREFIX"
       --tau          "$TAU"
       --delta        "$DELTA"
@@ -53,8 +55,12 @@ CMD=(./call_features
       --gamma-min-cand "$GAMMA_MIN_CAND"
       --k-min        "$K_MIN"
       --k-min2      "$K_MIN2"
-      --doublet-balance "$DOUBLET_BALANCE"
-      --cell-list    "$CELL_LIST")
+      --doublet-balance "$DOUBLET_BALANCE")
+
+# Add optional STARsolo directory if provided
+if [[ -n "$STARSOLO_DIR" ]]; then
+    CMD+=(--starsolo-dir "$STARSOLO_DIR")
+fi
 
 # Forward optional switches
 if [[ -n "$CELL_LIST" ]]; then

@@ -14,7 +14,9 @@
 #define _POSIX_C_SOURCE 200809L   // expose strdup, getline, etc.
 #define _DEFAULT_SOURCE          // (glibc) fallback for older POSIX defs
 #include <sys/types.h>
-#include <getopt.h>        // <── NEW
+#include <sys/stat.h>            // stat, mkdir
+#include <getopt.h>              // <── NEW
+#include <errno.h>               // errno
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -59,6 +61,118 @@ static void bh_fdr(const double *p,int n,double*q){ if(n<=0) return; IdxP*arr=(I
 /* Readers */
 static void read_lines(const char*path,VecS*out){ FILE*f=fopen(path,"r"); if(!f){ fprintf(stderr,"Cannot open %s\n",path); die("open"); } char*line=NULL; size_t len=0; ssize_t r; while((r=getline(&line,&len,f))>=0){ char*s=trim(line); if(*s==0) continue; vecs_push(out,s); } if(line) free(line); fclose(f); }
 static void read_features_firstcol(const char*path,VecS*feat_ids){ FILE*f=fopen(path,"r"); if(!f){ fprintf(stderr,"Cannot open %s\n",path); die("open"); } char*line=NULL; size_t len=0; ssize_t r; while((r=getline(&line,&len,f))>=0){ char*s=line; char*tab=strchr(s,'\t'); if(tab) *tab=0; s=trim(s); if(*s==0) continue; vecs_push(feat_ids,s);} if(line) free(line); fclose(f); }
+
+/* Helper: load barcode list with better diagnostics */
+static int load_barcode_list(const char *path, VecS *dest, const char *label) {
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "INFO: Cannot open %s for %s barcodes\n", path, label);
+        return 0;  /* not found */
+    }
+    
+    char *line = NULL;
+    size_t len = 0;
+    ssize_t r;
+    int count = 0;
+    
+    while ((r = getline(&line, &len, f)) >= 0) {
+        char *s = trim(line);
+        if (*s == 0) continue;
+        vecs_push(dest, s);
+        count++;
+    }
+    
+    if (line) free(line);
+    fclose(f);
+    
+    fprintf(stderr, "INFO: Loaded %d %s barcodes from %s\n", count, label, path);
+    return 1;  /* success */
+}
+
+/* Helper: try to load filtered barcodes from MTX directory */
+static int try_load_filtered_from_mtx(const char *mtx_dir, VecS *out) {
+    char path[1024];
+    
+    /* Try filtered_barcodes.tsv first */
+    snprintf(path, sizeof(path), "%s/filtered_barcodes.tsv", mtx_dir);
+    if (load_barcode_list(path, out, "MTX-derived filtered")) {
+        return 1;
+    }
+    
+    /* Try filtered_barcodes.txt second */
+    snprintf(path, sizeof(path), "%s/filtered_barcodes.txt", mtx_dir);
+    if (load_barcode_list(path, out, "MTX-derived filtered")) {
+        return 1;
+    }
+    
+    return 0;  /* not found */
+}
+
+/* Helper: mkdir -p equivalent - create directory and all parent directories */
+static int mkdir_p(const char *path) {
+    char tmp[1024];
+    char *p = NULL;
+    size_t len;
+    
+    snprintf(tmp, sizeof(tmp), "%s", path);
+    len = strlen(tmp);
+    if (tmp[len - 1] == '/') {
+        tmp[len - 1] = 0;
+    }
+    
+    for (p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = 0;
+            if (mkdir(tmp, S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH) != 0) {
+                if (errno != EEXIST) {
+                    fprintf(stderr, "WARNING: Cannot create directory %s: %s\n", tmp, strerror(errno));
+                    return -1;
+                }
+            }
+            *p = '/';
+        }
+    }
+    
+    if (mkdir(tmp, S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH) != 0) {
+        if (errno != EEXIST) {
+            fprintf(stderr, "WARNING: Cannot create directory %s: %s\n", tmp, strerror(errno));
+            return -1;
+        }
+    }
+    
+    return 0;
+}
+
+/* Helper: build output path - handles directory vs prefix mode */
+static void build_output_path(const char *out_prefix, const char *suffix, char *buf, size_t buf_size) {
+    struct stat st;
+    int is_directory = 0;
+    
+    /* Check if out_prefix ends with '/' or is an existing directory */
+    size_t len = strlen(out_prefix);
+    if (len > 0 && out_prefix[len - 1] == '/') {
+        is_directory = 1;
+    } else if (stat(out_prefix, &st) == 0 && S_ISDIR(st.st_mode)) {
+        is_directory = 1;
+    }
+    
+    if (is_directory) {
+        /* Directory mode: create directory if needed and place files inside */
+        if (mkdir_p(out_prefix) != 0) {
+            fprintf(stderr, "WARNING: Failed to create output directory %s\n", out_prefix);
+        }
+        
+        /* Combine directory + suffix without leading dot */
+        if (len > 0 && out_prefix[len - 1] == '/') {
+            snprintf(buf, buf_size, "%s%s", out_prefix, suffix);
+        } else {
+            snprintf(buf, buf_size, "%s/%s", out_prefix, suffix);
+        }
+    } else {
+        /* Prefix mode: traditional behavior with dot separator */
+        snprintf(buf, buf_size, "%s.%s", out_prefix, suffix);
+    }
+}
 
 typedef struct { char*barcode; int*counts; int total; } CellRec;
 
@@ -105,7 +219,7 @@ int main(int argc, char **argv)
             case 'n': use_fdr   = 0;           break;
             default:
                 fprintf(stderr,
-                    "Usage: %s --mtx-dir DIR --starsolo-dir DIR --out-prefix PRE "
+                    "Usage: %s --mtx-dir DIR [--starsolo-dir DIR] --out-prefix PRE "
                     "[--cell-list FILE] "
                     "[--tau X] [--delta X] [--gamma X] [--alpha X] [--floor N] "
                     "[--ambient-q X] [--no-fdr]\n", argv[0]);
@@ -114,9 +228,9 @@ int main(int argc, char **argv)
     }
     /* ------------------------------------------------ */
 
-    if (!mtx_dir || !solo_dir || !out_prefix) {
+    if (!mtx_dir || !out_prefix) {
         fprintf(stderr,
-            "ERROR: --mtx-dir, --starsolo-dir and --out-prefix are required\n");
+            "ERROR: --mtx-dir and --out-prefix are required\n");
         return 1;
     }
 
@@ -136,16 +250,52 @@ int main(int argc, char **argv)
     MapSI mtx_col_idx; mapsi_init(&mtx_col_idx,n_cols*2+1);
     for(int j=0;j<n_cols;++j) mapsi_put(&mtx_col_idx, mtx_barcodes.data[j], j);
 
-    /* STARsolo / cell list -------------------------------------------------- */
-    VecS raw_barcodes={0},filt_barcodes={0};
+    /* Barcode resolution with priority order */
+    VecS raw_barcodes={0}, filt_barcodes={0};
     vecs_init(&raw_barcodes); vecs_init(&filt_barcodes);
 
-    read_lines(path_raw, &raw_barcodes);
-
+    /* 1. Load filtered barcodes with priority order */
+    int filtered_source = 0;  /* 0=none, 1=cell-list, 2=mtx-derived, 3=starsolo */
+    
     if (cell_list_path) {
-        read_lines(cell_list_path, &filt_barcodes);
+        /* Priority 1: --cell-list provided by user */
+        if (load_barcode_list(cell_list_path, &filt_barcodes, "user-provided filtered")) {
+            filtered_source = 1;
+        }
+    }
+    
+    if (filtered_source == 0) {
+        /* Priority 2: MTX-derived filtered list */
+        if (try_load_filtered_from_mtx(mtx_dir, &filt_barcodes)) {
+            filtered_source = 2;
+        }
+    }
+    
+    if (filtered_source == 0 && solo_dir) {
+        /* Priority 3: STARsolo fallback */
+        if (load_barcode_list(path_filt, &filt_barcodes, "STARsolo filtered")) {
+            filtered_source = 3;
+        }
+    }
+    
+    if (filtered_source == 0) {
+        fprintf(stderr, "ERROR: No filtered barcode list found. Please either:\n");
+        fprintf(stderr, "  1. Provide --cell-list FILE, or\n");
+        fprintf(stderr, "  2. Add filtered_barcodes.tsv to your MTX directory, or\n");
+        fprintf(stderr, "  3. Supply --starsolo-dir with filtered/barcodes.tsv\n");
+        return 1;
+    }
+
+    /* 2. Load raw barcodes (for ambient estimation) */
+    if (solo_dir) {
+        /* Use STARsolo raw list when available */
+        load_barcode_list(path_raw, &raw_barcodes, "STARsolo raw");
     } else {
-        read_lines(path_filt, &filt_barcodes);
+        /* Fallback: use all MTX barcodes as raw */
+        fprintf(stderr, "INFO: No --starsolo-dir provided; using all MTX barcodes as raw set\n");
+        for (int i = 0; i < mtx_barcodes.n; ++i) {
+            vecs_push(&raw_barcodes, mtx_barcodes.data[i]);
+        }
     }
     int n_filtered = filt_barcodes.n;
 
@@ -301,11 +451,11 @@ int main(int argc, char **argv)
 
     /* outputs */
     char path_assign[1024],path_dbl[1024],path_amb[1024],path_unas[1024],path_miss[1024];
-    snprintf(path_assign,sizeof(path_assign), "%s.assignments.tsv", out_prefix);
-    snprintf(path_dbl,sizeof(path_dbl), "%s.doublets.txt", out_prefix);
-    snprintf(path_amb,sizeof(path_amb), "%s.ambiguous.txt", out_prefix);
-    snprintf(path_unas,sizeof(path_unas), "%s.unassignable.txt", out_prefix);
-    snprintf(path_miss,sizeof(path_miss), "%s.missing_cells.txt", out_prefix);
+    build_output_path(out_prefix, "assignments.tsv", path_assign, sizeof(path_assign));
+    build_output_path(out_prefix, "doublets.txt", path_dbl, sizeof(path_dbl));
+    build_output_path(out_prefix, "ambiguous.txt", path_amb, sizeof(path_amb));
+    build_output_path(out_prefix, "unassignable.txt", path_unas, sizeof(path_unas));
+    build_output_path(out_prefix, "missing_cells.txt", path_miss, sizeof(path_miss));
     FILE *fa=fopen(path_assign,"w"); if(!fa) die("open assignments");
     FILE *fd=fopen(path_dbl,"w"); if(!fd) die("open doublets");
     FILE *fb=fopen(path_amb,"w"); if(!fb) die("open ambiguous");

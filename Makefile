@@ -3,6 +3,8 @@
 #   make               # release build, optimised
 #   make DEBUG=1       # debug build
 #   make OPENMP=1      # enable OpenMP (add DEBUG=1 if needed)
+#   make OPENMP=1 THREADS=16   # build with OpenMP, will run with 16 threads by default
+#   OMP_NUM_THREADS still overrides at run-time
 #   make clean         # remove binary
 
 # ---------------------------------------------------------------------------
@@ -34,6 +36,10 @@ endif
 ifeq ($(OPENMP),1)
     CFLAGS  += -fopenmp -DUSE_OPENMP
     LDLIBS  += -fopenmp
+    # allow a default thread count at link-time (can be overridden later)
+    ifneq ($(THREADS),)
+        CFLAGS += -DDEFAULT_OMP_THREADS=$(THREADS)
+    endif
 endif
 
 # ---------------------------------------------------------------------------
@@ -41,30 +47,38 @@ endif
 LDLIBS  += -lm
 
 # ---------------------------------------------------------------------------
+# Executable output directory
+BINDIR := bin
+
 # Executable 1 – Flex Demux (fast, single-file)
 BIN1   := flex_demux_mtx
 SRC1   := src/flex_assign.c
 
-# Executable 2 – Call Features (streaming + optional EM)
+# Executable 2 – Call Features (streaming + optional EM + OpenMP)
 BIN2   := call_features
 SRC2   := src/call_features.c src/per_guide_em.c src/compute_Mmin_from_cells.c
 INCS   := -Iincludes          # header path for per_guide_em.h and compute_Mmin_from_cells.h
+
+# Paths of final binaries
+OUT1 := $(BINDIR)/$(BIN1)
+OUT2 := $(BINDIR)/$(BIN2)
 
 # ---------------------------------------------------------------------------
 # Common build rule macro
 define build_template
 $(1): $(2)
+	@mkdir -p $(BINDIR)
 	$$(CC) $$(CFLAGS) $$(INCS) $$^ -o $$@ $$(LDLIBS)
 endef
 
 # Instantiate the two rules
-$(eval $(call build_template,$(BIN1),$(SRC1)))
-$(eval $(call build_template,$(BIN2),$(SRC2)))
+$(eval $(call build_template,$(OUT1),$(SRC1)))
+$(eval $(call build_template,$(OUT2),$(SRC2)))
 
 # ---------------------------------------------------------------------------
 .PHONY: all clean
-all: $(BIN1) $(BIN2)
+all: $(OUT1) $(OUT2)
 
 clean:
-	rm -f $(BIN1) $(BIN2)
+	rm -f $(OUT1) $(OUT2)
 # ---------------------------------------------------------------------------

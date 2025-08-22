@@ -1,5 +1,7 @@
-# assign_features
+# call_features
 Produces an executable call_features that calls features from different experiments. Initially used for 10x flex sample barcodes, it has been extended to support different methods suitable for perturb-seq and lineage feature calls. Works with process_features which assigns and error corrects barcodes and UMIs and maps features to cell barcodes (GEMs). Open source fast alternative to 10x Cellranger software.
+
+For a statistical deep dive into the algorithms and parameterisation, see [docs/Technical.md](docs/Technical.md).
 
 ---
 
@@ -7,10 +9,14 @@ Produces an executable call_features that calls features from different experime
 
 ```bash
 make clean          # remove all executables and objects
-make all            # compile all executables
+make all            # serial build, single-thread runtime
+
+# optional: enable OpenMP (multi-thread EM)
+make all OPENMP=1    
 ```
 
-The build produces `call_features`.
+The build produces `call_features` (streaming demux with optional EM)
+and `flex_demux_mtx` (stand-alone FLEX implementation).
 
 ---
 
@@ -21,8 +27,10 @@ The build produces `call_features`.
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--mtx-dir DIR` | **required** | – | Directory with `matrix.mtx`, `features.tsv`, `barcodes.tsv`, `allowed_features.tsv` (or `features.txt` in `--process-features` mode). |
-| `--starsolo-dir DIR` | **required** | – | STARsolo *Gene* directory that contains `raw/` and `filtered/` barcode lists. |
-| `--out-prefix PFX` | **required** | – | Prefix for all output files. |
+| `--starsolo-dir DIR` | optional | – | STARsolo *Gene* directory that contains `raw/` and `filtered/` barcode lists. If not provided, filtered barcodes are searched in MTX directory. |
+| `--out-prefix PFX` | **required** | – | Prefix for all output files, or directory path (if ends with `/` or is existing directory). |
+| `--threads N` | int | **1** | Number of OpenMP threads. When compiled without OpenMP this flag is ignored. |
+| `--help`, `-h` | switch | – | Print brief help with all flags and exit. |
 | `--cell-list FILE` | optional | *none* | Replace STARsolo's filtered list with your own whitelist. |
 | `--tau X` | double | **0.8** | Fraction of counts in top feature required for singlet. |
 | `--delta X` | double | **0.4** | Minimum gap `f₁ − f₂` between the two top features. |
@@ -47,21 +55,17 @@ The build produces `call_features`.
 | Flag | Type | Default | Notes |
 |------|------|---------|-------|
 | `--mmin-from-cells` | switch | off | Enable data-driven determination of low-support cutoff. |
-| `--mmin-cells-method {otsu\|quantile\|model3}` | string | **otsu** | Histogram (Otsu), simple quantile, or three-component NB mixture. |
-| `--mmin-qcells Q` | double | **0.60** | Quantile used by the *quantile* method. |
-| `--mmin-cap N` | int | **1 000 000** | Safety ceiling: cutoffs above this are clamped. |
-| `--mmin3-max-iters` | int | **50** | Model3 EM iterations. |
-| `--mmin3-tol` | double | **1e-6** | Convergence tolerance. |
-| `--mmin3-update-disp` | 0/1 | **0** | Update NB dispersion parameters during Model3 EM. |
-| `--mmin3-init {quantiles\|kmeans}` | string | **quantiles** | Initialisation for Model3. |
-| `--mmin3-floor N` | int | `--floor` | Floor passed to Model3 internal negative binomials. |
+| `--mmin-cells-method {em-cell}` | string |
+| Initialisation for em-cells. |
+| `--mmin3-floor N` | int | `--floor` | Floor passed to em-cells internal negative binomials. |
 
 ### 2.4 EM-specific options
 
 | Flag | Type | Default | Rationale |
 |------|------|---------|-----------|
-| `--use-em` | switch | off | Activate per-guide EM; needed for low-MOI Perturb-seq where ambient NB mixture out-performs the simple binomial model. |
-| `--em-fixed-disp` | switch | off | Keeps NB dispersion parameters fixed during EM to avoid over-fitting when guide counts are sparse. |
+| `--use-em` | switch | off | Activate per-guide EM. |
+| `--min-em-counts N` | int | **10** | Skip EM for guides whose total count across all cells is `< N`; a background-only fit is written instead. |
+| `--em-fixed-disp` | switch | off | Keep NB dispersion parameters fixed during EM. |
 | `--tau-pos` | double | 0.95 | Posterior threshold to call a **positive** cell for a guide (primary threshold). |
 | `--tau-pos2` | double | `tau-pos − 0.05` | Looser posterior for the 2nd guide. Helps rescue real doublets that have slightly weaker evidence for the second feature. |
 | `--k-min` | int | 4 | Min raw counts for a guide to be considered present (primary). |
@@ -86,9 +90,7 @@ The build produces `call_features`.
 | **EM** | Per-guide NB2 mixture with learnt ambient & positive means | Handles overdispersion, great for low-count CRISPR screens. | Slow on >50 k guides; needs ≥ 2–3 counts in positives (`k-min`). |
 | **EM-fixed disp** | Same but freeze dispersion | Stabilises fits in sparse data. | Slight under-fit when guides are highly expressed. |
 | **Simple assign** | Pure ratio (`min-ratio`, `min-count`) | Blazing fast, good for cell hashing with distinct HTOs. | No p-values/FDR; unsafe for noisy perturb-seq. |
-| **Cell-derived M_min** <br> *otsu* | Histogram of `log1p(total)` | Data-adaptive cut-off without param tuning. | Unimodal / heavy-tail distributions push cutoff too high. |
-| **Cell-derived M_min** <br> *quantile* | Fixed percentile of total counts | Very predictable; works when abundance is heavy-tailed but unimodal. | Needs a chosen quantile (`--mmin-qcells`). |
-| **Cell-derived M_min** <br> *model3* | NB mixture (A/S/D components) | Best at separating ambient / singlet / doublet peaks. | More CPU; fails on <10 k cells. |
+| **Cell-derived M_min** <br> *EM-cell* | NB mixture (A/S/D components) | Best at separating ambient / singlet / doublet peaks. | More CPU; fails on <10 k cells. |
 
 ## 4  Example recipes 🍳
 
@@ -103,7 +105,7 @@ call_features \
   --tau 0.8 --delta 0.4 --gamma 0.9 --floor 12
 ```
 
-If there are more HTOs than 4 the EM option is possible and may give more coverage - basic command is given but look at scripts/runAssignEm.sh for more extensive parameters
+If there are more HTOs than 4 the EM option is possible and may give more coverage – see `scripts/runCallEm.sh` for a more extensive, tuned example.
 
 ```bash
 call_features \
@@ -130,7 +132,7 @@ call_features \
 
 ### 4.3 High-complexity lineage "Larry" barcodes (250 k possibilities)
 
-Lineage tracing with hundreds of thousands of possible barcodes. Most cells have unique barcodes, so simple ratio-based assignment is sufficient. The ratio can be adjusted. The defaults seem to be a good compromise between coverage and noise.
+Lineage tracing with hundreds of thousands of possible barcodes. Most cells have unique barcodes, so simple ratio-based assignment is sufficient. The ratio can be adjusted. The defaults seem to be a good compromise between coverage and noise. Alternatively, EM works very well but is a bit slower with the larger number of barcodes.
 
 ```bash
 call_features \
@@ -199,23 +201,30 @@ thresholds.
 2. **Feature allow-list**  
    Read `allowed_features.tsv`; map matrix rows → 1…K indices. In `--process-features` mode, all features from `features.txt` are considered allowed.
 
-3. **Single scan of `matrix.mtx`**  
+3. **Filtered barcode resolution**  
+   Search for filtered cell barcodes in priority order:  
+   • **Priority 1**: `--cell-list FILE` (user-provided)  
+   • **Priority 2**: `filtered_barcodes.tsv` or `filtered_barcodes.txt` in MTX directory  
+   • **Priority 3**: `--starsolo-dir/filtered/barcodes.tsv` (STARsolo fallback)  
+   If none found, exit with guidance.
+
+4. **Single scan of `matrix.mtx`**  
    • Ambient counts: features × negatives (raw - filtered barcodes).  
    • Per-cell feature vectors (only for barcodes present in the filtered set).  
 
-4. **Ambient model & thresholds**  
+5. **Ambient model & thresholds**  
    • Trimmed Poisson pre-filter on negative totals.  
    • Estimate `M_ambient`, compare with NB model if overdispersed.  
    • Statistical power threshold `M_stat` via binomial tail on highest ambient proportion.  
    • Final `M_min = max(M_ambient, M_stat, floor)` unless `--m-min-fixed` or `--mmin-from-cells` override.
 
-5. **Per-cell tests**  
+6. **Per-cell tests**  
    • **FLEX mode**: For each cell, compute p-value of top feature (`p1`) and second (`p2`) vs ambient.  
    • **EM mode**: Fit per-guide NB mixture models, compute posterior probabilities.  
    • **Simple mode**: Direct ratio and count thresholds.  
    • FDR-correct (unless `--no-fdr`) → `q1`, `q2`.  
 
-6. **Classification**  
+7. **Classification**  
    • **Singlet** if `f1 ≥ τ`, `f1-f2 ≥ δ`, `q1 < α`.  
    • **Doublet** if `f1+f2 ≥ γ`, balance check passes, and both `q1,q2 < α`.  
    • Else **Ambiguous**.  
@@ -228,6 +237,17 @@ Outputs are written as five plain-text files:
 - `.unassignable.txt` - Low-support cells
 - `.missing_cells.txt` - Cells in whitelist but not in MTX
 
+### Output Modes
+
+The `--out-prefix` parameter supports two modes:
+
+**Prefix mode (traditional)**: `--out-prefix myrun` creates:
+- `myrun.assignments.tsv`, `myrun.doublets.txt`, etc.
+
+**Directory mode**: `--out-prefix results/` or `--out-prefix results` (if `results` exists) creates:
+- `results/assignments.tsv`, `results/doublets.txt`, etc.
+- The directory is automatically created if it doesn't exist.
+
 ---
 
 ## 6  Testing and validation
@@ -236,13 +256,15 @@ The repository includes test scripts:
 
 ```bash
 # Test individual methods
-./scripts/testAssignPerturb.sh {flex|em|em-fixed|simple|otsu|quantile|model3}
+./scripts/testCallPerturb.sh {flex|em|em-fixed|simple|em-cell}
 
 # Compare all methods side-by-side
 ./scripts/compareAllMethods.sh
 ```
 
 The comparison script generates a detailed table showing how different algorithms perform on the same dataset, helping you choose the best approach for your experiment type.
+
+For a full flag reference and method details, see docs/Methods.md.
 
 ---
 
