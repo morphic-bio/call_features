@@ -1,0 +1,873 @@
+
+/*
+ * flex_demux_mtx_stream.c  (EM-integrated, debug-friendly)
+ *
+ * Streaming MTX demux tool with optional per-guide EM.
+ * Default: "flex" rules (binomial vs ambient, top-1 dominance, optional doublet).
+ * --use-em: per-guide EM (NB mixture with exposure + ambient) for low-MOI Perturb-seq.
+ *
+ * New flags for EM:
+ *   --em-fixed-disp           : freeze NB dispersion updates (background/positive)
+ *   --tau-pos2 <f>            : posterior threshold for the 2nd guide (default = tau-pos or tau-pos-0.05)
+ *   --k-min2 <i>              : min counts for 2nd guide (default = max(2, k-min))
+ *   --gamma-min-cand <f>      : dominance using candidate-only denominator (c1+c2)/sum_cand >= value (default 0.85).
+ *                               Doublet passes if EITHER (c1+c2)/total >= gamma_min OR candidate-only dominance >= gamma_min_cand.
+ *   --doublet-balance 0|1     : require 20–80% balance for top2 (default 1)
+ *   --debug-amb <file>        : dump CSV of ambiguous cells with top1/top2 stats and reasons
+ *
+ * Build:
+ *   gcc -O3 -march=native -o flex_demux_mtx_stream flex_demux_mtx_stream.c per_guide_em.c -lm
+ *   # optional: -fopenmp -DUSE_OPENMP
+ */
+
+/* ========================================================================== */
+/*  Move feature-test macros to very top ─ must precede <stdio.h>/<string.h>. */
+#define _POSIX_C_SOURCE 200809L
+#define _DEFAULT_SOURCE              /* for older glibc */
+#include <sys/types.h>               /* ssize_t prototype */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <ctype.h>
+#include <stdint.h>                  /* SIZE_MAX */
+#include "per_guide_em.h"
+#include "compute_Mmin_from_cells.h"
+#include <getopt.h>
+
+/* ───────────────── POSIX helpers ───────────────── */
+// --------------------------------------------------
+
+/* ---------- small containers ---------- */
+typedef struct { char **data; int n, cap; } VecS;
+typedef struct { int  *data; int n, cap; } VecI;
+typedef struct { double *data; int n, cap; } VecD;
+typedef struct { int feat; int count; } FC;
+typedef struct { FC *data; int n, cap; } VecFC;
+typedef struct { int a; int b; } PairI;
+typedef struct { PairI *data; int n, cap; } VecPI;
+
+static void die(const char *msg){ fprintf(stderr,"ERROR: %s\n", msg); exit(1); }
+static char* trim(char*s){ if(!s) return s; while(isspace((unsigned char)*s)) s++; if(*s==0) return s; char*e=s+strlen(s)-1; while(e>s && isspace((unsigned char)*e)) *e--=0; return s; }
+static void vecs_init(VecS *v){ v->data=NULL; v->n=0; v->cap=0; }
+static void veci_init(VecI *v){ v->data=NULL; v->n=0; v->cap=0; }
+static void vecd_init(VecD *v){ v->data=NULL; v->n=0; v->cap=0; }
+static void vecfc_init(VecFC *v){ v->data=NULL; v->n=0; v->cap=0; }
+static void vecpi_init(VecPI *v){ v->data=NULL; v->n=0; v->cap=0; }
+
+static void vecs_push(VecS *v, const char *s){
+    if (v->n == v->cap){
+        v->cap = v->cap ? v->cap * 2 : 256;
+        v->data = (char **)realloc(v->data, v->cap * sizeof(char*));
+        if (!v->data) die("OOM vecs");
+    }
+    v->data[v->n++] = strdup(s ? s : "");
+}
+static void veci_push(VecI *v, int x){ if(v->n==v->cap){ v->cap=v->cap? v->cap*2:256; v->data=(int*)realloc(v->data,v->cap*sizeof(int)); if(!v->data) die("OOM veci"); } v->data[v->n++]=x; }
+static void vecd_push(VecD *v, double x){ if(v->n==v->cap){ v->cap=v->cap? v->cap*2:256; v->data=(double*)realloc(v->data,v->cap*sizeof(double)); if(!v->data) die("OOM vecd"); } v->data[v->n++]=x; }
+static void vecfc_inc(VecFC *v, int feat1_based, int add){
+    if (feat1_based < 1) return;
+    for (int i=0;i<v->n;++i){ if (v->data[i].feat == feat1_based){ v->data[i].count += add; return; } }
+    if (v->n==v->cap){ v->cap = v->cap? v->cap*2 : 4; v->data=(FC*)realloc(v->data, v->cap*sizeof(FC)); if(!v->data) die("OOM vecfc"); }
+    v->data[v->n].feat = feat1_based; v->data[v->n].count = add; v->n++;
+}
+static void vecfc_free(VecFC *v){ if(v->data) free(v->data); v->data=NULL; v->n=v->cap=0; }
+static void vecpi_push(VecPI *v, int a, int b){ if(v->n==v->cap){ v->cap=v->cap? v->cap*2:4; v->data=(PairI*)realloc(v->data,v->cap*sizeof(PairI)); if(!v->data) die("OOM vecpi"); } v->data[v->n].a=a; v->data[v->n].b=b; v->n++; }
+
+static int cmp_int(const void *a,const void *b){ int x=*(const int*)a,y=*(const int*)b; return (x<y)?-1:(x>y); }
+
+/* --- string->int map --- */
+typedef struct { char **keys; int *vals; int cap; int n; } MapSI;
+static unsigned long hash_str(const char *s){ unsigned long h=1469598103934665603ULL; while(*s){ h^=(unsigned char)(*s++); h*=1099511628211ULL; } return h; }
+static void mapsi_init(MapSI *m, int cap){ m->cap=1; while(m->cap<cap*2) m->cap<<=1; m->keys=(char**)calloc(m->cap,sizeof(char*)); m->vals=(int*)malloc(m->cap*sizeof(int)); m->n=0; }
+static void mapsi_put(MapSI *m, const char *key, int val){
+    if ((m->n+1)*2 > m->cap){
+        int oc=m->cap; char **ok=m->keys; int *ov=m->vals;
+        m->cap<<=1; m->keys=(char**)calloc(m->cap,sizeof(char*)); m->vals=(int*)malloc(m->cap*sizeof(int)); m->n=0;
+        for(int i=0;i<oc;++i){ if(ok[i]){ unsigned long h=hash_str(ok[i]); int j=(int)(h&(m->cap-1)); while(m->keys[j]) j=(j+1)&(m->cap-1); m->keys[j]=ok[i]; m->vals[j]=ov[i]; m->n++; } }
+        free(ok); free(ov);
+    }
+    unsigned long h=hash_str(key); int i=(int)(h&(m->cap-1));
+    while(m->keys[i]){ if(strcmp(m->keys[i],key)==0){ m->vals[i]=val; return; } i=(i+1)&(m->cap-1); }
+    m->keys[i]=strdup(key); m->vals[i]=val; m->n++;
+}
+static int mapsi_get(const MapSI*m, const char *key){
+    unsigned long h=hash_str(key); int i=(int)(h&(m->cap-1));
+    while(m->keys[i]){ if(strcmp(m->keys[i],key)==0) return m->vals[i]; i=(i+1)&(m->cap-1); }
+    return -1;
+}
+static void mapsi_free(MapSI *m){ for(int i=0;i<m->cap;++i) if(m->keys[i]) free(m->keys[i]); free(m->keys); free(m->vals); }
+
+/* ---------- prob tails ---------- */
+static double binom_tail_ge(int k,int n,double p){
+    if (k<=0) return 1.0;
+    if (k>n) return 0.0;
+    double q = 1.0 - p;
+    double pmf = pow(q, n), cdf = pmf;
+    for (int i=0;i<k-1;++i){
+        pmf *= (double)(n - i) / (double)(i+1) * (p/q);
+        cdf += pmf;
+        if (1.0 - cdf < 1e-16) return 0.0;
+    }
+    double t = 1.0 - cdf; return (t<0?0:t);
+}
+typedef struct { int idx; double p; } IdxP;
+static int cmp_idxp(const void *a,const void *b){ double x=((const IdxP*)a)->p,y=((const IdxP*)b)->p; return (x<y)?-1:(x>y); }
+static void bh_fdr(const double *p, int n, double *q){
+    if (n<=0) return;
+    IdxP *arr=(IdxP*)malloc(n*sizeof(IdxP));
+    for(int i=0;i<n;++i){ arr[i].idx=i; arr[i].p=p[i]; }
+    qsort(arr,n,sizeof(IdxP),cmp_idxp);
+    double prev=1.0;
+    for(int r=1;r<=n;++r){ int i=arr[r-1].idx; double val=arr[r-1].p * n / (double)r; if(val<prev) prev=val; q[i]= prev<1.0? prev:1.0; }
+    free(arr);
+}
+
+/* ---------- IO ---------- */
+static void read_lines(const char*path, VecS*out){
+    FILE *f=fopen(path,"r"); if(!f){ fprintf(stderr,"Cannot open %s\n",path); exit(1); }
+    char *line=NULL; size_t len=0; ssize_t r;
+    while((r=getline(&line,&len,f))>=0){ char *s=trim(line); if(*s==0) continue; vecs_push(out,s); }
+    if(line) free(line);
+    fclose(f);
+}
+static void read_features_firstcol(const char*path, VecS*feat_ids){
+    FILE *f=fopen(path,"r"); if(!f){ fprintf(stderr,"Cannot open %s\n",path); exit(1); }
+    char *line=NULL; size_t len=0; ssize_t r;
+    while((r=getline(&line,&len,f))>=0){
+        char *s=line; char *tab=strchr(s,'\t'); if(tab) *tab=0;
+        s=trim(s); if(*s==0) continue; vecs_push(feat_ids,s);
+    }
+    if(line) free(line);
+    fclose(f);
+}
+
+/* ───────────────────────── EM defaults helper ───────────────────────── */
+/* per_guide_em.c keeps its default setter static, so we replicate the tiny
+ * initialiser locally instead of calling a non-visible symbol.            */
+static PGEMParams default_PGEM_params(void){
+    PGEMParams P = {0};
+    P.max_iters     = 50;
+    P.tol           = 1e-6;
+    P.update_disp   = 1;
+    P.r_bg_init     = 50.0;
+    P.r_pos_init    = 50.0;
+    P.r_lo = 5.0;   P.r_hi   = 500.0;
+    P.a_bg_lo = 1.0; P.a_bg_hi  = 50.0;
+    P.a_pos_lo = 1e-6; P.a_pos_hi = 50.0;
+    P.pi_lo = 1e-4; P.pi_hi = 0.999;
+    P.cap_z = 0.99; P.winsor_mult = 5.0; P.trim_hi_q = 0.995;
+    P.ambient_floor = 1e-9;
+    return P;
+}
+
+/* ---------- main ---------- */
+int main(int argc, char **argv){
+    const char *mtx_dir=NULL, *solo_dir=NULL, *out_prefix=NULL;
+    /* flex (non-EM) defaults */
+    double tau=0.8, delta=0.4, gamma=0.9, alpha=1e-4;
+    int floor_=12, use_fdr=1;
+    /* shared */
+    double ambient_q=0.999;
+    /* EM options */
+    int use_em=0;
+    double tau_pos=0.95, gamma_min=0.8; int k_min=4;
+    const char *cell_list_path = NULL;
+    /* New EM options */
+    int em_fixed_disp=0;
+    double tau_pos2=-1.0; int k_min2=-1;
+    double gamma_min_cand=0.85;
+    int require_balance=1;
+    int k_small = 4;              /* NEW: min #features for EM */
+    const char *debug_amb_path=NULL;
+    /* process-features mode */
+    int process_features=0;
+    
+    /* NEW: cell-derived M_min flags */
+    int mmin_from_cells=0;
+    const char *mmin_cells_method="otsu";  /* otsu|quantile|model3 */
+    double mmin_qcells=0.60;
+    int mmin_cap=1000000000;  /* 1e9 */
+    /* model3 specific */
+    int mmin3_max_iters=50;
+    double mmin3_tol=1e-6;
+    int mmin3_update_disp=0;
+    const char *mmin3_init="quantiles";  /* quantiles|kmeans */
+    int mmin3_floor=-1;  /* will default to floor_ */
+    
+    /* NEW: simple classification flags */
+    int simple_assign=0;       /* enable simple classification */
+    int min_count=2;           /* minimum count for top feature */
+    double min_ratio=2.0;      /* minimum ratio of top1/top2 counts */
+
+    /* NEW: fixed low-count floor */
+    int m_min_fixed = -1;      /* <0 = not set */
+
+    /* ---------------- getopt_long ---------------- */
+    static struct option long_opts[]={
+        {"mtx-dir",required_argument,0,'m'},
+        {"starsolo-dir",required_argument,0,'s'},
+        {"out-prefix",required_argument,0,'o'},
+        {"cell-list",required_argument,0,'c'},
+
+        {"tau",required_argument,0,  1},
+        {"delta",required_argument,0, 2},
+        {"gamma",required_argument,0, 3},
+        {"alpha",required_argument,0, 4},
+        {"floor",required_argument,0, 5},
+        {"ambient-q",required_argument,0,6},
+        {"no-fdr",no_argument,0,7},
+
+        {"use-em",no_argument,0,8},
+        {"tau-pos",required_argument,0,9},
+        {"k-min",required_argument,0,10},
+        {"gamma-min",required_argument,0,11},
+
+        {"em-fixed-disp",no_argument,0,12},
+        {"tau-pos2",required_argument,0,13},
+        {"k-min2",required_argument,0,14},
+        {"gamma-min-cand",required_argument,0,15},
+        {"doublet-balance",required_argument,0,16},
+        {"debug-amb",required_argument,0,17},
+        {"k-small",required_argument,0,18},          /* NEW */
+        {"process-features",no_argument,0,19},       /* NEW */
+        
+        /* NEW: cell-derived M_min options */
+        {"mmin-from-cells",no_argument,0,20},
+        {"mmin-cells-method",required_argument,0,21},
+        {"mmin-qcells",required_argument,0,22},
+        {"mmin-cap",required_argument,0,23},
+        {"mmin3-max-iters",required_argument,0,24},
+        {"mmin3-tol",required_argument,0,25},
+        {"mmin3-update-disp",required_argument,0,26},
+        {"mmin3-init",required_argument,0,27},
+        {"mmin3-floor",required_argument,0,28},
+        
+        /* NEW: simple classification options */
+        {"simple-assign",no_argument,0,29},
+        {"min-count",required_argument,0,30},
+        {"min-ratio",required_argument,0,31},
+
+        /* NEW: hard floor option */
+        {"m-min-fixed",required_argument,0,32},
+        {0,0,0,0}
+    };
+    int opt_idx=0; int copt;
+    while((copt=getopt_long(argc,argv,"",long_opts,&opt_idx))!=-1){
+        switch(copt){
+            case 'm': mtx_dir=optarg; break;
+            case 's': solo_dir=optarg; break;
+            case 'o': out_prefix=optarg; break;
+            case 'c': cell_list_path=optarg; break;
+
+            case 1: tau=atof(optarg); break;
+            case 2: delta=atof(optarg); break;
+            case 3: gamma=atof(optarg); break;
+            case 4: alpha=atof(optarg); break;
+            case 5: floor_=atoi(optarg); break;
+            case 6: ambient_q=atof(optarg); break;
+            case 7: use_fdr=0; break;
+
+            case 8: use_em=1; break;
+            case 9: tau_pos=atof(optarg); break;
+            case 10: k_min=atoi(optarg); break;
+            case 11: gamma_min=atof(optarg); break;
+
+            case 12: em_fixed_disp=1; break;
+            case 13: tau_pos2=atof(optarg); break;
+            case 14: k_min2=atoi(optarg); break;
+            case 15: gamma_min_cand=atof(optarg); break;
+            case 16: require_balance=atoi(optarg); break;
+            case 17: debug_amb_path=optarg; break;
+            case 18: k_small = atoi(optarg); break;          /* NEW */
+            case 19: process_features=1; break;              /* NEW */
+            
+            /* NEW: cell-derived M_min cases */
+            case 20: mmin_from_cells=1; break;
+            case 21: mmin_cells_method=optarg; break;
+            case 22: mmin_qcells=atof(optarg); break;
+            case 23: mmin_cap=atoi(optarg); break;
+            case 24: mmin3_max_iters=atoi(optarg); break;
+            case 25: mmin3_tol=atof(optarg); break;
+            case 26: mmin3_update_disp=atoi(optarg); break;
+            case 27: mmin3_init=optarg; break;
+            case 28: mmin3_floor=atoi(optarg); break;
+            
+            /* NEW: simple classification cases */
+            case 29: simple_assign=1; break;
+            case 30: min_count=atoi(optarg); break;
+            case 31: min_ratio=atof(optarg); break;
+
+            /* NEW: parse hard M_min */
+            case 32: m_min_fixed = atoi(optarg); break;
+            default: fprintf(stderr,"Unknown option\n"); return 1;
+        }
+    }
+    if(!mtx_dir||!solo_dir||!out_prefix){
+        fprintf(stderr,"Usage: ... required flags missing\n");
+        return 1;
+    }
+    if (tau_pos2 < 0) tau_pos2 = (tau_pos > 0.1 ? (tau_pos - 0.05) : tau_pos);
+    if (k_min2 < 0)  k_min2 = (k_min > 1 ? k_min - 1 : k_min);
+    if (mmin3_floor < 0) mmin3_floor = floor_;
+
+    /* paths */
+    char path_barcodes[1024], path_features[1024], path_mtx[1024], path_allowed[1024];
+    if (process_features) {
+        snprintf(path_barcodes,sizeof(path_barcodes), "%s/barcodes.txt", mtx_dir);
+        snprintf(path_features,sizeof(path_features), "%s/features.txt", mtx_dir);
+        snprintf(path_mtx,sizeof(path_mtx), "%s/matrix.mtx", mtx_dir);
+        snprintf(path_allowed,sizeof(path_allowed), "%s/allowed_features.txt", mtx_dir);
+    } else {
+        snprintf(path_barcodes,sizeof(path_barcodes), "%s/barcodes.tsv", mtx_dir);
+        snprintf(path_features,sizeof(path_features), "%s/features.tsv", mtx_dir);
+        snprintf(path_mtx,sizeof(path_mtx), "%s/matrix.mtx", mtx_dir);
+        snprintf(path_allowed,sizeof(path_allowed), "%s/allowed_features.tsv", mtx_dir);
+    }
+    char path_raw[1024], path_filt[1024];
+    snprintf(path_raw,sizeof(path_raw), "%s/raw/barcodes.tsv", solo_dir);
+    snprintf(path_filt,sizeof(path_filt), "%s/filtered/barcodes.tsv", solo_dir);
+
+    /* load barcodes & features */
+    VecS mtx_barcodes={0}, feat_ids={0}, allowed={0};
+    vecs_init(&mtx_barcodes); vecs_init(&feat_ids); vecs_init(&allowed);
+    read_lines(path_barcodes,&mtx_barcodes);
+    read_features_firstcol(path_features,&feat_ids);
+    
+    if (process_features) {
+        /* Try to read allowed_features, but don't require it */
+        FILE *test_allowed = fopen(path_allowed, "r");
+        if (test_allowed) {
+            fclose(test_allowed);
+            read_lines(path_allowed, &allowed);
+            printf("Running in --process-features mode with allowed_features file: all features will be treated as allowed; enrichment stats suppressed.\n");
+        } else {
+            /* No allowed_features file, treat all features as allowed */
+            for (int i = 0; i < feat_ids.n; ++i) {
+                vecs_push(&allowed, feat_ids.data[i]);
+            }
+            printf("Running in --process-features mode: all features will be treated as allowed; enrichment stats suppressed.\n");
+        }
+    } else {
+        read_lines(path_allowed,&allowed);
+    }
+    
+    int n_cols=mtx_barcodes.n;
+    if (n_cols<=0 || feat_ids.n<=0 || allowed.n<=0) die("empty inputs");
+
+    /* barcode -> column map */
+    MapSI mtx_col_idx; mapsi_init(&mtx_col_idx, n_cols*2+1);
+    for (int j=0;j<n_cols;++j) mapsi_put(&mtx_col_idx, mtx_barcodes.data[j], j);
+
+    /* STARsolo sets */
+    VecS raw_barcodes={0}, filt_barcodes={0}; vecs_init(&raw_barcodes); vecs_init(&filt_barcodes);
+
+    read_lines(path_raw, &raw_barcodes);
+
+    if (cell_list_path)
+        read_lines(cell_list_path, &filt_barcodes);
+    else
+        read_lines(path_filt, &filt_barcodes);
+
+    int n_filtered = filt_barcodes.n;
+    MapSI filt_map; mapsi_init(&filt_map, n_filtered*2+1);
+    for(int i=0;i<n_filtered;++i) mapsi_put(&filt_map, filt_barcodes.data[i], 1);
+    VecI cells_cols={0}, negs_cols={0}; veci_init(&cells_cols); veci_init(&negs_cols);
+    int missing_cells=0;
+    for(int i=0;i<n_filtered;++i){
+        int col=mapsi_get(&mtx_col_idx, filt_barcodes.data[i]);
+        if (col>=0) veci_push(&cells_cols, col); else missing_cells++;
+    }
+    for(int i=0;i<raw_barcodes.n;++i){
+        if (mapsi_get(&filt_map, raw_barcodes.data[i])==1) continue;
+        int col=mapsi_get(&mtx_col_idx, raw_barcodes.data[i]);
+        if (col>=0) veci_push(&negs_cols, col);
+    }
+
+    /* allowlist map: row -> 1..K */
+    MapSI allowed_map; mapsi_init(&allowed_map, allowed.n*2+1);
+    for(int i=0;i<allowed.n;++i) mapsi_put(&allowed_map, allowed.data[i], i+1);
+    int K=0; int *row_to_allowed=(int*)malloc(feat_ids.n*sizeof(int));
+    for(int i=0;i<feat_ids.n;++i){ int idx=mapsi_get(&allowed_map, feat_ids.data[i]); row_to_allowed[i]=(idx>=1? idx:-1); if(idx>K) K=idx; }
+    if (K<=0) die("No overlap allowed_features.tsv vs features.tsv");
+
+    /* ---- NEW: fallback to non-EM if too few features ---- */
+    if (K < k_small){
+        fprintf(stderr," Switching to simpler  methodology without EM due to small number of features\n");
+        use_em = 0;
+    }
+
+    /* column status: 0=ignore, 1=cell, 2=neg */
+    int *col_status=(int*)calloc(n_cols,sizeof(int));
+    for(int t=0;t<cells_cols.n;++t) col_status[cells_cols.data[t]]=1;
+    for(int t=0;t<negs_cols.n;++t)  col_status[negs_cols.data[t]]=2;
+
+    /* per-cell structures */
+    int C = cells_cols.n;
+    /* guard: refuse insane allocation sizes */
+    if ((size_t)C > SIZE_MAX / sizeof(int)) die("C too large");
+    int *col_to_cellidx=(int*)malloc(n_cols*sizeof(int));
+    for (int j=0;j<n_cols;++j) col_to_cellidx[j]=-1;
+    for (int i=0;i<C;++i) col_to_cellidx[cells_cols.data[i]]=i;
+    char **cell_barcodes=(char**)malloc((size_t)C*sizeof(char*));
+    for (int i=0;i<C;++i) cell_barcodes[i]=strdup(mtx_barcodes.data[cells_cols.data[i]]);
+    int *cell_tot=(int*)calloc((size_t)C,sizeof(int));
+
+    /* For flex path: per-cell sparse vectors; For EM path: per-guide inverted lists */
+    VecFC *cell_vecs=NULL;
+    VecPI *guide_lists=NULL;
+    if (!use_em){
+        cell_vecs=(VecFC*)calloc((size_t)C,sizeof(VecFC));
+        for (int i=0;i<C;++i) vecfc_init(&cell_vecs[i]);
+    } else {
+        guide_lists=(VecPI*)calloc((size_t)(K+1),sizeof(VecPI));
+        for (int g=1; g<=K; ++g) vecpi_init(&guide_lists[g]);
+    }
+
+    /* ambient accumulators and neg totals */
+    double *ambient_colsum=(double*)calloc(K+1,sizeof(double));
+    VecI neg_totals={0}; veci_init(&neg_totals);
+
+    /* read MTX (single pass) */
+    FILE *fm=fopen(path_mtx,"r"); if(!fm){ fprintf(stderr,"Cannot open %s\n", path_mtx); return 1; }
+    char *line=NULL; size_t len=0; ssize_t rr;
+    if ((rr=getline(&line,&len,fm))<0) die("matrix.mtx empty");
+    if (strncmp(line,"%%MatrixMarket",14)!=0) die("Not a Matrix Market file");
+    while ((rr=getline(&line,&len,fm))>=0){
+        char *s=trim(line);
+        if (*s=='%') continue;
+        int n_rows=0, n_cols2=0, nnz=0;
+        if (sscanf(s,"%d %d %d",&n_rows,&n_cols2,&nnz)!=3) die("Bad size line");
+        int r_i, c_j; double v;
+        for (int t=0;t<nnz;++t){
+            if ((rr=getline(&line,&len,fm))<0) die("Unexpected EOF in triplets");
+            if (sscanf(line,"%d %d %lf",&r_i,&c_j,&v)!=3) die("Bad triplet");
+            int row0=r_i-1, col0=c_j-1;
+            if (row0<0 || row0>=feat_ids.n || col0<0 || col0>=n_cols) continue;
+            int aidx=row_to_allowed[row0]; if (aidx<1) continue;
+            int status=col_status[col0];
+            if (status==2){
+                ambient_colsum[aidx] += v;
+            } else if (status==1){
+                int ci=col_to_cellidx[col0];
+                if (ci>=0){
+                    cell_tot[ci] += (int)v;
+                    if (!use_em) vecfc_inc(&cell_vecs[ci], aidx, (int)v);
+                    else vecpi_push(&guide_lists[aidx], ci, (int)v);
+                }
+            }
+        }
+        break;
+    }
+    if (line) free(line);
+    fclose(fm);
+
+    /* Build neg totals per column (second pass) */
+    int *neg_col_flags=(int*)calloc(n_cols,sizeof(int));
+    for (int j=0;j<negs_cols.n;++j) neg_col_flags[negs_cols.data[j]] = 1;
+    int *neg_tot_arr=(int*)calloc(n_cols,sizeof(int));
+    fm=fopen(path_mtx,"r"); if(!fm){ fprintf(stderr,"Cannot open %s\n", path_mtx); return 1; }
+    line=NULL; len=0;
+    if ((rr=getline(&line,&len,fm))<0) die("matrix.mtx empty (2nd pass)");
+    while ((rr=getline(&line,&len,fm))>=0){
+        char *s=trim(line);
+        if (*s=='%') continue;
+        int n_rows, n_cols2, nnz;
+        if (sscanf(s,"%d %d %d",&n_rows,&n_cols2,&nnz)!=3) die("Bad size line 2");
+        int r_i, c_j; double v;
+        for (int t=0;t<nnz;++t){
+            if ((rr=getline(&line,&len,fm))<0) die("Unexpected EOF 2");
+            if (sscanf(line,"%d %d %lf",&r_i,&c_j,&v)!=3) die("Bad triplet 2");
+            int col0=c_j-1;
+            if (col0>=0 && col0<n_cols && neg_col_flags[col0]) neg_tot_arr[col0] += (int)v;
+        }
+        break;
+    }
+    if (line) free(line);
+    fclose(fm);
+    for (int j=0;j<n_cols;++j) if (neg_col_flags[j]) veci_push(&neg_totals, neg_tot_arr[j]);
+    free(neg_col_flags); free(neg_tot_arr);
+
+    /* ambient composition r (1..K) */
+    double amb_sum=0.0; for (int g=1; g<=K; ++g) amb_sum += ambient_colsum[g];
+    VecD rvec={0}; vecd_init(&rvec);
+    if (amb_sum <= 0){ for (int g=1; g<=K; ++g) vecd_push(&rvec, 1.0/(double)K); }
+    else { for (int g=1; g<=K; ++g) vecd_push(&rvec, ambient_colsum[g]/amb_sum); }
+
+    /* thresholds from negatives: compute M_min */
+    int Nneg=neg_totals.n;
+    int *neg_sorted=(int*)malloc((Nneg>0?Nneg:1)*sizeof(int));
+    if (Nneg>0) memcpy(neg_sorted, neg_totals.data, Nneg*sizeof(int));
+    qsort(neg_sorted, Nneg, sizeof(int), cmp_int);
+    int cut=(int)floor(0.7*Nneg); if (cut<1 && Nneg>0) cut=1;
+    double lam_hat=0.0; for (int i=0;i<cut;++i) lam_hat += neg_sorted[i]; lam_hat /= (double)(cut>0?cut:1);
+    double p_cut=fmin(1e-6, 0.1 / fmax(1, Nneg));
+
+    VecI kept_tot={0}; veci_init(&kept_tot);
+    for (int i=0;i<Nneg;++i){
+        int k=neg_totals.data[i];
+        double pmf=exp(-lam_hat), cdf=pmf;
+        for (int x=1;x<k;++x){ pmf*=lam_hat/(double)x; cdf+=pmf; if (1.0-cdf<1e-16) break; }
+        double tail=(k<=0)?1.0:fmax(0.0,1.0-cdf);
+        if (tail >= p_cut) veci_push(&kept_tot, k);
+    }
+    int Kk=kept_tot.n;
+    int *ks=(int*)malloc((Kk>0?Kk:1)*sizeof(int)); if (Kk>0) memcpy(ks, kept_tot.data, Kk*sizeof(int));
+    qsort(ks, Kk, sizeof(int), cmp_int);
+    int lo_i=(int)floor(0.10*Kk), hi_i=(int)floor(0.80*Kk);
+    if (hi_i<=lo_i){ lo_i=0; hi_i=Kk; }
+    double mu=0.0,var=0.0; int len2=hi_i-lo_i; if(len2<=0){ lo_i=0; hi_i=Kk; len2=Kk; }
+    for (int i=lo_i;i<hi_i;++i) mu += ks[i];
+    mu /= (double)fmax(1,len2);
+    for (int i=lo_i;i<hi_i;++i){ double d=ks[i]-mu; var += d*d; } var /= (double)fmax(1,len2-1);
+    int over = (var > 1.2*mu);
+    int m_emp=0; if (Kk>0){ int idx=(int)floor((Kk-1)*ambient_q); if(idx<0) idx=0; if(idx>=Kk) idx=Kk-1; m_emp=ks[idx]; }
+
+    double alpha_amb=1e-3; int m_mod=0;
+    if (!over || var<=mu){
+        int m=(int)fmax(0.0,floor(mu));
+        while (1){
+            int k=m; double pmf=exp(-mu), cdf=pmf;
+            for (int x=1;x<k;++x){ pmf*= mu/(double)x; cdf+=pmf; if (1.0-cdf<1e-16) break; }
+            double tail=(k<=0)?1.0:fmax(0.0,1.0-cdf);
+            if (tail <= alpha_amb) break;
+            m++; if (m > (int)(mu+10*sqrt(mu+1))) break;
+        }
+        m_mod=m;
+    } else {
+        double rnb=(mu*mu)/fmax(1e-9,(var-mu));
+        double mu_eff = mu * (1.0 + mu/fmax(1.0,rnb));
+        int m=(int)fmax(0.0,floor(mu_eff));
+        while (1){
+            int k=m; double pmf=exp(-mu_eff), cdf=pmf;
+            for (int x=1;x<k;++x){ pmf*= mu_eff/(double)x; cdf+=pmf; if (1.0-cdf<1e-16) break; }
+            double tail=(k<=0)?1.0:fmax(0.0,1.0-cdf);
+            if (tail <= alpha_amb) break;
+            m++; if (m > (int)(mu_eff+10*sqrt(mu_eff+1))) break;
+        }
+        m_mod=m;
+    }
+    int M_ambient = (m_emp > m_mod ? m_emp : m_mod);
+    /* flex-stat limit based on r_max */
+    double rmax=0.0; for (int j=0;j<rvec.n;++j) if (rvec.data[j] > rmax) rmax = rvec.data[j];
+    int M_stat=1; for (int m=1;m<=1000;++m){ int kth=(int)floor(tau*m); if(kth<1) kth=1; double pt=binom_tail_ge(kth,m,rmax); if(pt<alpha){ M_stat=m; break; } M_stat=m; }
+    int M_min;
+    if (m_min_fixed >= 0) {
+        /* user-supplied hard floor */
+        M_min = m_min_fixed;
+    } else {
+        /* original ambient/stat/floor logic */
+        M_min = M_ambient;
+        if (M_stat > M_min) M_min = M_stat;
+        if (floor_   > M_min) M_min = floor_;
+    }
+    
+    /* NEW: Cell-derived M_min computation */
+    if (mmin_from_cells) {
+        MminMethod method = parse_mmin_method(mmin_cells_method);
+        Mmin3Params m3_params;
+        set_default_mmin3_params(&m3_params, mmin3_floor);
+        m3_params.max_iters = mmin3_max_iters;
+        m3_params.tol = mmin3_tol;
+        m3_params.update_disp = mmin3_update_disp;
+        m3_params.init_method = parse_mmin3_init(mmin3_init);
+        
+        Mmin3Fit m3_fit;
+        int result = compute_Mmin_from_cells(
+            cell_tot, C, floor_, mmin_cap,
+            method, mmin_qcells,
+            &m3_params, &M_min, &m3_fit
+        );
+        
+        if (result != 0) {
+            fprintf(stderr, "WARNING: Cell-derived M_min computation failed, using traditional method\n");
+        } else {
+            printf("Cell-derived M_min: %d (method: %s)\n", M_min, mmin_cells_method);
+            if (method == MMIN_METHOD_MODEL3) {
+                printf("Model3 fit: pi_A=%.3f, pi_S=%.3f, pi_D=%.3f, mu_A=%.1f, mu_S=%.1f, mu_D=%.1f, converged=%d\n",
+                       m3_fit.pi_A, m3_fit.pi_S, m3_fit.pi_D, m3_fit.mu_A, m3_fit.mu_S, m3_fit.mu_D, m3_fit.converged);
+            }
+        }
+    } else {
+        /* Keep for debugging: hardcoded values */
+        // M_min=2;
+        // M_ambient=2;
+    }
+    /* outputs */
+    char path_assign[1024], path_dbl[1024], path_amb[1024], path_unas[1024], path_miss[1024];
+    snprintf(path_assign,sizeof(path_assign), "%s.assignments.tsv", out_prefix);
+    snprintf(path_dbl,sizeof(path_dbl), "%s.doublets.txt", out_prefix);
+    snprintf(path_amb,sizeof(path_amb), "%s.ambiguous.txt", out_prefix);
+    snprintf(path_unas,sizeof(path_unas), "%s.unassignable.txt", out_prefix);
+    snprintf(path_miss,sizeof(path_miss), "%s.missing_cells.txt", out_prefix);
+    FILE *fa=fopen(path_assign,"w"); if(!fa) die("open assignments");
+    FILE *fd=fopen(path_dbl,"w"); if(!fd) die("open doublets");
+    FILE *fb=fopen(path_amb,"w"); if(!fb) die("open ambiguous");
+    FILE *fu=fopen(path_unas,"w"); if(!fu) die("open unassignable");
+    FILE *fmz=fopen(path_miss,"w"); if(!fmz) die("open missing");
+
+    for (int i=0;i<filt_barcodes.n;++i){
+        if (mapsi_get(&mtx_col_idx, filt_barcodes.data[i]) < 0) fprintf(fmz,"%s\n",filt_barcodes.data[i]);
+    }
+    fclose(fmz);
+
+    int n_singlet=0, n_doublet=0, n_ambig=0, n_low=0;
+
+    if (simple_assign) {
+        /* ------- SIMPLE CLASSIFICATION PATH ------- */
+        printf("Using simple classification: min_count=%d, min_ratio=%.2f\n", min_count, min_ratio);
+        
+        for (int i=0; i<C; ++i) {
+            if (cell_tot[i] == 0) {
+                fprintf(fu,"%s\n", cell_barcodes[i]); 
+                n_low++; 
+                continue; 
+            }
+            
+            /* Find top1 and top2 counts */
+            int top1_idx = -1;
+            int top1_count = 0, top2_count = 0;
+            
+            if (!use_em && cell_vecs) {
+                /* Use cell_vecs for non-EM mode */
+                for (int kx=0; kx<cell_vecs[i].n; ++kx) {
+                    int feat = cell_vecs[i].data[kx].feat;
+                    int count = cell_vecs[i].data[kx].count;
+                    if (count > top1_count) {
+                        top2_count = top1_count;
+                        top1_count = count; top1_idx = feat;
+                    } else if (count > top2_count) {
+                        top2_count = count;
+                    }
+                }
+            } else {
+                /* Use guide_lists for EM mode or fallback */
+                int *counts = (int*)calloc(K+1, sizeof(int));
+                if (use_em && guide_lists) {
+                    for (int g=1; g<=K; ++g) {
+                        for (int t=0; t<guide_lists[g].n; ++t) {
+                            if (guide_lists[g].data[t].a == i) {
+                                counts[g] = guide_lists[g].data[t].b;
+                                break;
+                            }
+                        }
+                    }
+                } 
+                
+                for (int g=1; g<=K; ++g) {
+                    if (counts[g] > top1_count) {
+                        top2_count = top1_count;
+                        top1_count = counts[g]; top1_idx = g;
+                    } else if (counts[g] > top2_count) {
+                        top2_count = counts[g];
+                    }
+                }
+                free(counts);
+            }
+            
+            /* Simple classification rules */
+            if (top1_count < min_count) {
+                /* Insufficient count */
+                fprintf(fu,"%s\n", cell_barcodes[i]);
+                n_low++; 
+            } else if (top2_count == 0 || (double)top1_count / (double)top2_count >= min_ratio) {
+                /* Clear single winner */
+                fprintf(fa,"%s\t%d\n", cell_barcodes[i], top1_idx); 
+                n_singlet++;
+            } else if (top1_count == top2_count) {
+                /* Tie - ambiguous */
+                fprintf(fb,"%s\n", cell_barcodes[i]); 
+                n_ambig++;
+            } else {
+                /* Multiple features present but no clear dominance */
+                fprintf(fb,"%s\n", cell_barcodes[i]); 
+                n_ambig++;
+            }
+        }
+        
+    } else if (!use_em){
+        /* ------- FLEX PATH ------- */
+        /* compute per-cell top1/top2 and p-values */
+        int Cn=C;
+        double *p1=(double*)malloc(Cn*sizeof(double));
+        double *p2=(double*)malloc(Cn*sizeof(double));
+        double *q1=(double*)malloc(Cn*sizeof(double));
+        double *q2=(double*)malloc(Cn*sizeof(double));
+        int *j1=(int*)malloc(Cn*sizeof(int));
+        int *j2=(int*)malloc(Cn*sizeof(int));
+        int *c1=(int*)malloc(Cn*sizeof(int));
+        int *c2=(int*)malloc(Cn*sizeof(int));
+        for (int i=0;i<Cn;++i){
+            if (cell_tot[i] < M_min){ j1[i]=j2[i]=-1; c1[i]=c2[i]=0; p1[i]=p2[i]=1.0; continue; }
+            int t1=-1,t2=-1, v1=0,v2=0;
+            for (int kx=0;kx<cell_vecs[i].n;++kx){
+                int feat=cell_vecs[i].data[kx].feat;
+                int val =cell_vecs[i].data[kx].count;
+                if (val > v1){ v2=v1; t2=t1; v1=val; t1=feat; }
+                else if (val > v2){ v2=val; t2=feat; }
+            }
+            j1[i]=t1; j2[i]=t2; c1[i]=v1; c2[i]=v2;
+            double r1=(t1>=1)? rvec.data[t1-1]:0.0;
+            double r2=(t2>=1)? rvec.data[t2-1]:0.0;
+            p1[i]=(t1>=1)? binom_tail_ge(c1[i], cell_tot[i], r1):1.0;
+            p2[i]=(t2>=1 && c2[i]>0)? binom_tail_ge(c2[i], cell_tot[i], r2):1.0;
+        }
+        if (use_fdr){ bh_fdr(p1,Cn,q1); bh_fdr(p2,Cn,q2); } else { for (int i=0;i<Cn;++i){ q1[i]=p1[i]; q2[i]=p2[i]; } }
+
+        for (int i=0;i<Cn;++i){
+            if (cell_tot[i] < M_min){ fprintf(fu,"%s\n", cell_barcodes[i]); n_low++; continue; }
+            double f1 = (cell_tot[i]>0)? (double)c1[i]/(double)cell_tot[i]:0.0;
+            double f2 = (cell_tot[i]>0)? (double)c2[i]/(double)cell_tot[i]:0.0;
+            double top_sum = f1 + f2;
+            double frac1 = (top_sum>0)? f1/top_sum : 0.0;
+            int is_singlet = (f1>=tau) && ((f1-f2)>=delta) && (q1[i] < alpha);
+            int is_doublet = (top_sum>=gamma) && (frac1>=0.2 && frac1<=0.8) && (q1[i]<alpha) && (q2[i]<alpha);
+            if (is_singlet && j1[i]>=1){ fprintf(fa,"%s\t%d\n", cell_barcodes[i], j1[i]); n_singlet++; }
+            else if (is_doublet){ fprintf(fd,"%s\n", cell_barcodes[i]); n_doublet++; }
+            else { fprintf(fb,"%s\n", cell_barcodes[i]); n_ambig++; }
+        }
+        free(p1); free(p2); free(q1); free(q2); free(j1); free(j2); free(c1); free(c2);
+    } else {
+        /* ------- EM PATH ------- */
+        /* per-guide EM fit and candidate accumulation */
+        int N=C;
+        int *c=(int*)calloc(N,sizeof(int));
+        int *m_exp=(int*)malloc(N*sizeof(int));
+        for (int i=0;i<N;++i) m_exp[i]=cell_tot[i];
+        double *P=(double*)malloc(N*sizeof(double));
+        int *cand_count=(int*)calloc(N,sizeof(int));
+        int *top1_gid=(int*)malloc(N*sizeof(int));
+        int *top2_gid=(int*)malloc(N*sizeof(int));
+        int *top1_cnt=(int*)calloc(N,sizeof(int));
+        int *top2_cnt=(int*)calloc(N,sizeof(int));
+        for (int i=0;i<N;++i){ top1_gid[i]=top2_gid[i]=-1; }
+
+        /* also track candidate-only totals per cell */
+        int *cand_sum=(int*)calloc(N,sizeof(int));
+
+        /* per-guide QC files */
+        char path_fit[1024], path_pos[1024];
+        snprintf(path_fit,sizeof(path_fit), "%s.per_guide_fit.tsv", out_prefix);
+        snprintf(path_pos,sizeof(path_pos), "%s.per_guide_poscounts.tsv", out_prefix);
+        FILE *ff=fopen(path_fit,"w"); if(!ff) die("open per_guide_fit.tsv");
+        FILE *fp=fopen(path_pos,"w"); if(!fp) die("open per_guide_poscounts.tsv");
+        fprintf(ff,"guide_index\tpi_pos\ta_bg\ta_pos\tr_bg\tr_pos\titers\n");
+        fprintf(fp,"guide_index\tpositive_cells\n");
+
+        PGEMParams Ppar = default_PGEM_params();   /* replaces set_defaults(&Ppar); */
+        if (em_fixed_disp) Ppar.update_disp = 0;
+
+        for (int g=1; g<=K; ++g){
+            for (int i=0;i<N;++i) c[i]=0;
+            for (int t=0;t<guide_lists[g].n;++t){
+                int ci=guide_lists[g].data[t].a;
+                int val=guide_lists[g].data[t].b;
+                c[ci]=val;
+            }
+            PGEMFit fit; int rc=pgem_fit(c, m_exp, N, rvec.data[g-1], &Ppar, &fit, P);
+            if (rc!=0){ fprintf(stderr,"WARN: pgem_fit failed for guide %d\n", g); continue; }
+            fprintf(ff, "%d\t%.6g\t%.6g\t%.6g\t%.6g\t%.6g\t%d\n", g, fit.pi_pos, fit.a_bg, fit.a_pos, fit.r_bg, fit.r_pos, fit.iters);
+
+            int pos_cells=0;
+            for (int i=0;i<N;++i){
+                if (m_exp[i] < M_min) continue;
+                int pass1 = (P[i] >= tau_pos && c[i] >= k_min);
+                int pass2 = (P[i] >= tau_pos2 && c[i] >= k_min2);
+                if (pass1){ pos_cells++; cand_count[i]++; cand_sum[i] += c[i];
+                    if (c[i] > top1_cnt[i]){ top2_cnt[i]=top1_cnt[i]; top2_gid[i]=top1_gid[i]; top1_cnt[i]=c[i]; top1_gid[i]=g; }
+                    else if (c[i] > top2_cnt[i]){ top2_cnt[i]=c[i]; top2_gid[i]=g; }
+                } else if (pass2){
+                    cand_count[i]++; cand_sum[i] += c[i];
+                    if (c[i] > top1_cnt[i]){ top2_cnt[i]=top1_cnt[i]; top2_gid[i]=top1_gid[i]; top1_cnt[i]=c[i]; top1_gid[i]=g; }
+                    else if (c[i] > top2_cnt[i]){ top2_cnt[i]=c[i]; top2_gid[i]=g; }
+                }
+            }
+            fprintf(fp, "%d\t%d\n", g, pos_cells);
+        }
+        fclose(ff); fclose(fp);
+
+        /* optional debug dump */
+        FILE *fdbg=NULL;
+        if (debug_amb_path){ fdbg=fopen(debug_amb_path,"w"); if(fdbg){ fprintf(fdbg,"barcode,tot,c1,c2,top_sum,top_sum_cand,frac1,cand_count,reason\n"); } }
+
+        /* stats for why doublet failed */
+        int cells_ge2=0, fail_balance=0, fail_dom_all=0, fail_dom_cand=0, fail_other=0;
+
+        for (int i=0;i<N;++i){
+            if (m_exp[i] < M_min){ fprintf(fu,"%s\n", cell_barcodes[i]); n_low++; continue; }
+            if (cand_count[i] <= 0){
+                fprintf(fb,"%s\n", cell_barcodes[i]); n_ambig++; continue;
+            } else if (cand_count[i] == 1 && top1_gid[i]>=1){
+                fprintf(fa, "%s\t%d\n", cell_barcodes[i], top1_gid[i]); n_singlet++; continue;
+            } else {
+                cells_ge2++;
+                int g2=top2_gid[i];
+                int c1=top1_cnt[i], c2=top2_cnt[i];
+                double top_sum_all = (double)(c1+c2)/(double)m_exp[i];
+                double top_sum_c = (cand_sum[i] > 0)? (double)(c1+c2)/(double)cand_sum[i] : 0.0;
+                double frac1=(c1+c2>0)? (double)c1/(double)(c1+c2) : 0.0;
+                int ok_balance = (!require_balance) || (frac1>=0.2 && frac1<=0.8);
+                int ok_dom_all = (top_sum_all >= gamma_min);
+                int ok_dom_c   = (top_sum_c >= gamma_min_cand);
+
+                if (g2>=1 && ok_balance && (ok_dom_all || ok_dom_c)){
+                    fprintf(fd,"%s\n", cell_barcodes[i]); n_doublet++;
+                } else {
+                    fprintf(fb,"%s\n", cell_barcodes[i]); n_ambig++;
+                    if (g2<1) { fail_other++; if(fdbg) fprintf(fdbg,"%s,%d,%d,%d,%.6f,%.6f,%.6f,%d,no_top2\n", cell_barcodes[i], m_exp[i], c1, c2, top_sum_all, top_sum_c, frac1, cand_count[i]); }
+                    else if (!ok_balance && require_balance){ fail_balance++; if(fdbg) fprintf(fdbg,"%s,%d,%d,%d,%.6f,%.6f,%.6f,%d,balance\n", cell_barcodes[i], m_exp[i], c1, c2, top_sum_all, top_sum_c, frac1, cand_count[i]); }
+                    else if (!ok_dom_all && !ok_dom_c){ if (!ok_dom_all) fail_dom_all++; if(!ok_dom_c) fail_dom_cand++; if(fdbg) fprintf(fdbg,"%s,%d,%d,%d,%.6f,%.6f,%.6f,%d,dominance\n", cell_barcodes[i], m_exp[i], c1, c2, top_sum_all, top_sum_c, frac1, cand_count[i]); }
+                    else { fail_other++; if(fdbg) fprintf(fdbg,"%s,%d,%d,%d,%.6f,%.6f,%.6f,%d,other\n", cell_barcodes[i], m_exp[i], c1, c2, top_sum_all, top_sum_c, frac1, cand_count[i]); }
+                }
+            }
+        }
+        if (fdbg) fclose(fdbg);
+
+        /* print debug summary */
+        printf("EM debug: cells with >=2 candidates: %d\n", cells_ge2);
+        printf("EM debug: failed balance: %d, failed dominance(all): %d, failed dominance(cand): %d, other: %d\n",
+                fail_balance, fail_dom_all, fail_dom_cand, fail_other);
+
+        free(c); free(m_exp); free(P); free(cand_count); free(top1_gid); free(top2_gid); free(top1_cnt); free(top2_cnt); free(cand_sum);
+    }
+
+    fclose(fa); fclose(fd); fclose(fb); fclose(fu);
+
+    /* QC */
+    int cells_in_mtx = C;
+    printf("Filtered STARsolo cells: %d\n", n_filtered);
+    printf("Cells present in MTX: %d  (missing: %d)\n", cells_in_mtx, missing_cells);
+    int total_eval = n_singlet + n_doublet + n_ambig + n_low;
+    printf("Evaluated (filtered∩MTX): %d\n", total_eval);
+    printf("Singlet: %d (%.3f)\n", n_singlet, (total_eval? (double)n_singlet/total_eval : 0.0));
+    printf("Doublet: %d (%.3f)\n", n_doublet, (total_eval? (double)n_doublet/total_eval : 0.0));
+    printf("Ambiguous: %d (%.3f)\n", n_ambig, (total_eval? (double)n_ambig/total_eval : 0.0));
+    printf("Low support: %d (%.3f)\n", n_low, (total_eval? (double)n_low/total_eval : 0.0));
+    printf("M_min=%d (M_ambient=%d, M_stat=%d, floor=%d), overdispersed=%s, r_max=%.4f\n",
+           M_min, M_ambient, M_stat, floor_, (over? "yes":"no"), rmax);
+
+    /* cleanup */
+    if (cell_vecs){ for (int i=0;i<C;++i) vecfc_free(&cell_vecs[i]); free(cell_vecs); }
+    if (guide_lists){ for (int g=1; g<=K; ++g) if (guide_lists[g].data) free(guide_lists[g].data); free(guide_lists); }
+    free(cell_tot); for (int i=0;i<C;++i) free(cell_barcodes[i]); free(cell_barcodes);
+    free(col_to_cellidx); free(col_status);
+    free(ambient_colsum); free(neg_sorted); free(ks);
+    for (int i=0;i<mtx_barcodes.n;++i) free(mtx_barcodes.data[i]);
+    free(mtx_barcodes.data);
+    
+    for (int i=0;i<feat_ids.n;++i) free(feat_ids.data[i]);
+    free(feat_ids.data);
+    
+    for (int i=0;i<allowed.n;++i) free(allowed.data[i]);
+    free(allowed.data);
+    
+    for (int i=0;i<raw_barcodes.n;++i) free(raw_barcodes.data[i]);
+    free(raw_barcodes.data);
+    
+    for (int i=0;i<filt_barcodes.n;++i) free(filt_barcodes.data[i]);
+    free(filt_barcodes.data);
+    free(row_to_allowed);
+    mapsi_free(&mtx_col_idx); mapsi_free(&filt_map); mapsi_free(&allowed_map);
+    free(rvec.data);
+    return 0;
+}
