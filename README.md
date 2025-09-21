@@ -118,7 +118,7 @@ call_features \
 
 ### 4.2 Low-MOI CRISPR Perturb-seq (≈3 k guides)
 
-CRISPR screens where most cells have 0-1 guides. EM handles sparse counts and ambient contamination better than binomial tests.
+CRISPR screens where most cells are expected to have a single guide. EM handles sparse counts and ambient contamination better than binomial tests.
 
 ```bash
 call_features \
@@ -132,7 +132,7 @@ call_features \
 
 ### 4.3 High-complexity lineage "Larry" barcodes (250 k possibilities)
 
-Lineage tracing with hundreds of thousands of possible barcodes. Most cells have unique barcodes, so simple ratio-based assignment is sufficient. The ratio can be adjusted. The defaults seem to be a good compromise between coverage and noise. Alternatively, EM works very well but is a bit slower with the larger number of barcodes.
+Lineage tracing with hundreds of thousands of possible barcodes. Ambient noise tends to be much lower. As a result most cells have unique barcodes or a clearly dominant barcode, so simple ratio-based assignment is sufficient. The ratio can be adjusted. The default ratio seem to be a good compromise between coverage and noise. Alternatively, EM also works very well but is a bit slower with the larger number of barcodes.
 
 ```bash
 call_features \
