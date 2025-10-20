@@ -1,7 +1,10 @@
 # call_features
 Produces an executable call_features that calls features from different experiments. Initially used for 10x flex sample barcodes, it has been extended to support different methods suitable for perturb-seq and lineage feature calls. Works with process_features which assigns and error corrects barcodes and UMIs and maps features to cell barcodes (GEMs). Open source fast alternative to 10x Cellranger software.
 
-For a statistical deep dive into the algorithms and parameterisation, see [docs/Technical.md](docs/Technical.md).
+**Documentation:**
+- [docs/Technical.md](docs/Technical.md) - Statistical deep dive into algorithms and parameterization
+- [docs/APPLY_ALL_SUMMARY.md](docs/APPLY_ALL_SUMMARY.md) - Quick reference for `--apply-all` flag
+- [docs/TESTING_COMPLETE.md](docs/TESTING_COMPLETE.md) - Testing results and validation
 
 ---
 
@@ -92,8 +95,8 @@ By default, `call_features` trains thresholds on the **filtered barcode list** (
 - Output files (`assignments.tsv`, `doublets.txt`, etc.) contain results for both filtered and unfiltered barcodes
 - Barcodes already processed in the filtered set are skipped with a warning if duplicates are detected
 - Quality filters (`M_min`) still apply—barcodes with insufficient counts are excluded
-- For **FLEX mode**: Uses learned `tau`, `delta`, `gamma` thresholds without recomputing FDR
-- For **EM mode**: Applies learned parameters to classify additional barcodes
+- For **FLEX mode**: Computes p-values vs ambient for each barcode and applies the same decision rules (`f1 ≥ tau`, `(f1-f2) ≥ delta`, `q < alpha`) used in training. Uses raw p-values (no FDR recomputation across expanded set)
+- For **EM mode**: Uses stored EM fit parameters (a_bg, a_pos, r_bg, r_pos, pi_pos) to evaluate each guide, then applies the same candidate-counting and dominance logic as the main path
 - For **simple-assign**: Trivially extends to all barcodes (no training phase)
 
 **Memory consideration**: `--apply-all` allocates arrays sized to the full matrix (`n_cols`), which can be ~1.6M for large datasets. This is acceptable for correctness-first workflows.

@@ -1,0 +1,16 @@
+INFO: Loaded 10 MTX-derived filtered barcodes from /mnt/pikachu/call_features/test_em/matrix/filtered_barcodes.tsv
+INFO: No --starsolo-dir provided; using all MTX barcodes as raw set
+INFO: --apply_all enabled: allocating tracking for all 30 barcodes
+[call_features] Skipped 0 guides with <5 total counts; ran EM on 3 guides using 1 threads
+INFO: Applying learned thresholds to all 30 barcodes
+INFO: --apply_all added: 6 singlets, 0 doublets, 13 ambiguous, 1 low
+EM debug: cells with >=2 candidates: 1
+EM debug: failed balance: 1, failed dominance(all): 0, failed dominance(cand): 0, other: 0
+Filtered STARsolo cells: 10
+Cells present in MTX: 10  (missing: 0)
+Evaluated (filtered∩MTX): 30
+Singlet: 8 (0.267)
+Doublet: 0 (0.000)
+Ambiguous: 21 (0.700)
+Low support: 1 (0.033)
+M_min=10 (M_ambient=136, M_stat=34, floor=12), overdispersed=yes, r_max=0.4664

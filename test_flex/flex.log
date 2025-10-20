@@ -1,0 +1,14 @@
+INFO: Loaded 10 MTX-derived filtered barcodes from /mnt/pikachu/call_features/test_flex/matrix/filtered_barcodes.tsv
+INFO: No --starsolo-dir provided; using all MTX barcodes as raw set
+ Switching to simpler  methodology without EM due to small number of features
+INFO: --apply_all enabled: allocating tracking for all 30 barcodes
+INFO: Applying learned thresholds to all 30 barcodes
+INFO: --apply_all added: 0 singlets, 0 doublets, 0 ambiguous, 20 low
+Filtered STARsolo cells: 10
+Cells present in MTX: 10  (missing: 0)
+Evaluated (filtered∩MTX): 30
+Singlet: 0 (0.000)
+Doublet: 0 (0.000)
+Ambiguous: 0 (0.000)
+Low support: 30 (1.000)
+M_min=136 (M_ambient=136, M_stat=30, floor=12), overdispersed=yes, r_max=0.4664

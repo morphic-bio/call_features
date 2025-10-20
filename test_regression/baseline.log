@@ -1,0 +1,12 @@
+INFO: Loaded 10 MTX-derived filtered barcodes from /mnt/pikachu/call_features/test_regression/matrix/filtered_barcodes.tsv
+INFO: No --starsolo-dir provided; using all MTX barcodes as raw set
+ Switching to simpler  methodology without EM due to small number of features
+Using simple classification: min_count=3, min_ratio=1.50
+Filtered STARsolo cells: 10
+Cells present in MTX: 10  (missing: 0)
+Evaluated (filtered∩MTX): 10
+Singlet: 6 (0.600)
+Doublet: 0 (0.000)
+Ambiguous: 4 (0.400)
+Low support: 0 (0.000)
+M_min=10 (M_ambient=136, M_stat=34, floor=12), overdispersed=yes, r_max=0.4664
