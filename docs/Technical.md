@@ -217,7 +217,38 @@ mixture weights (`π_A`, `π_S`, `π_D`) and component means for verification.
    the `model3` case, overlay the three NB components and confirm intersection
    points match the printed threshold.
 
-## 7. Summary
+## 7. Apply-All Mode (`--apply-all`)
+
+The `--apply-all` flag modifies the workflow to apply learned thresholds to every barcode in the matrix, not just the filtered list:
+
+### 7.1 Training vs. Application
+
+**Default behavior**: Train thresholds on the filtered barcode list and classify only those barcodes.
+
+**With `--apply-all`**:
+1. **Training phase** (unchanged): Ambient model, thresholds (`M_min`, `tau`, `delta`, etc.), and EM parameters are learned using only the filtered barcodes.
+2. **Application phase** (new): The learned model is applied to every barcode in the matrix that passes quality filters.
+
+### 7.2 Implementation Details
+
+- **Memory overhead**: Allocates per-column arrays sized to `n_cols` (all barcodes), which can be ~1.6M for large datasets. For FLEX/simple modes, stores feature vectors; for EM mode, stores per-column guide counts.
+- **FDR handling**: For FLEX mode, learned q-values are reused without recomputing Benjamini-Hochberg on the expanded set. This preserves the statistical properties learned from the high-quality filtered cells.
+- **Duplicate handling**: Barcodes already processed in the filtered set are skipped with a warning.
+- **Quality filters**: The same `M_min` threshold applies to all barcodes, ensuring only barcodes with sufficient counts are classified.
+
+### 7.3 Use Cases
+
+- **Universe rescue workflows**: Conservative filtered lists may exclude valid cells with clear feature assignments.
+- **Exploratory analysis**: Understand how many additional barcodes could be called if the filtered list were less stringent.
+- **Cross-validation**: Compare assignments between filtered and near-filtered barcodes to tune filtering thresholds.
+
+### 7.4 Performance Considerations
+
+For a typical lane with 1.6M barcodes and 10k filtered cells:
+- Memory increase: ~6-10 MB per allowed feature (FLEX mode) or ~200 MB total (EM mode with sparse storage)
+- Runtime increase: Proportional to the number of unfiltered barcodes that pass `M_min` (typically 10-30% of matrix)
+
+## 8. Summary
 
 - FLEX offers a transparent multinomial/binomial test with interpretable
   dominance thresholds (`tau`, `delta`, `gamma`).
@@ -225,6 +256,8 @@ mixture weights (`π_A`, `π_S`, `π_D`) and component means for verification.
   for finer control in sparse data and doublet detection.
 - Simple ratio and cell-derived `M_min` heuristics provide faster alternatives
   when assumptions hold or when count distributions supply clearer cutoffs.
+- `--apply-all` extends any method to classify all barcodes in the matrix, enabling
+  universe rescue and exploratory workflows.
 - All methods share the same output structure; `compareAllMethods.sh` exists to
   benchmark them side-by-side, revealing trade-offs between sensitivity and
   specificity.

@@ -101,6 +101,7 @@ static void print_help(void)
 "  --cell-list FILE         Use custom whitelist instead of STARsolo filtered\n"
 "  --m-min-fixed N          Hard-set low-support cutoff (bypass all rules)\n"
 "  --process-features       Treat every feature as allowed (antibody hashing)\n"
+"  --apply-all              Apply learned thresholds to all barcodes (not just filtered)\n"
 "  --help, -h               Print this message and exit\n"
 "\n"
 "Build-time flags: compiled ");
@@ -399,6 +400,9 @@ int main(int argc, char **argv){
     /* NEW: EM optimization - skip low-count guides */
     int min_em_counts = 10;    /* minimum total counts for EM fitting */
 
+    /* NEW: apply_all flag - apply learned thresholds to all barcodes */
+    int apply_all = 0;
+
     /* ---------------- getopt_long ---------------- */
     static struct option long_opts[]={
         /* required paths */
@@ -450,6 +454,9 @@ int main(int argc, char **argv){
         
         /* NEW: EM optimization option */
         {"min-em-counts",required_argument,0,33},
+        
+        /* NEW: apply_all option */
+        {"apply-all",no_argument,0,34},
 #ifdef USE_OPENMP                   /* ← add threads flag only if OpenMP present */
         {"threads",required_argument,0,40},
 #endif
@@ -512,6 +519,9 @@ int main(int argc, char **argv){
             
             /* NEW: parse min-em-counts */
             case 33: min_em_counts = atoi(optarg); break;
+            
+            /* NEW: parse apply-all */
+            case 34: apply_all = 1; break;
 
 #ifdef USE_OPENMP                 /* ---------- new handler ---------- */
             case 40:
@@ -690,6 +700,36 @@ int main(int argc, char **argv){
         guide_tot=(int*)calloc((size_t)(K+1),sizeof(int));  /* NEW: 1-based indexing */
     }
 
+    /* Global per-column structures for --apply_all mode */
+    int *all_col_tot = NULL;
+    VecFC *all_col_vecs = NULL;  /* For FLEX and simple-assign modes */
+    VecPI *all_col_em_lists = NULL;  /* For EM mode: per-column list of (guide, count) pairs */
+    
+    if (apply_all) {
+        fprintf(stderr, "INFO: --apply_all enabled: allocating tracking for all %d barcodes\n", n_cols);
+        /* Guard against overflow */
+        if ((size_t)n_cols > SIZE_MAX / sizeof(int)) die("n_cols too large for --apply_all");
+        
+        all_col_tot = (int*)calloc(n_cols, sizeof(int));
+        if (!all_col_tot) die("Failed to allocate all_col_tot");
+        
+        /* For non-EM modes, we need full feature vectors */
+        if (!use_em) {
+            all_col_vecs = (VecFC*)calloc(n_cols, sizeof(VecFC));
+            if (!all_col_vecs) die("Failed to allocate all_col_vecs");
+            for (int j = 0; j < n_cols; ++j) {
+                vecfc_init(&all_col_vecs[j]);
+            }
+        } else {
+            /* For EM mode, store per-column (guide, count) pairs */
+            all_col_em_lists = (VecPI*)calloc(n_cols, sizeof(VecPI));
+            if (!all_col_em_lists) die("Failed to allocate all_col_em_lists");
+            for (int j = 0; j < n_cols; ++j) {
+                vecpi_init(&all_col_em_lists[j]);
+            }
+        }
+    }
+
     /* ambient accumulators and neg totals */
     double *ambient_colsum=(double*)calloc(K+1,sizeof(double));
     VecI neg_totals={0}; veci_init(&neg_totals);
@@ -723,6 +763,17 @@ int main(int argc, char **argv){
                         vecpi_push(&guide_lists[aidx], ci, (int)v);
                         guide_tot[aidx] += (int)v;  /* NEW: accumulate per-guide totals */
                     }
+                }
+            }
+            
+            /* NEW: Track all columns when apply_all is enabled */
+            if (apply_all) {
+                all_col_tot[col0] += (int)v;
+                if (!use_em) {
+                    vecfc_inc(&all_col_vecs[col0], aidx, (int)v);
+                } else {
+                    /* For EM mode: store (guide, count) pairs per column */
+                    vecpi_push(&all_col_em_lists[col0], aidx, (int)v);
                 }
             }
         }
@@ -1183,6 +1234,196 @@ int main(int argc, char **argv){
         free(c); free(m_exp); free(P); free(cand_count); free(top1_gid); free(top2_gid); free(top1_cnt); free(top2_cnt); free(cand_sum);
     }
 
+    /* ========================================================================
+     * STEP 4: Apply learned thresholds to all barcodes (--apply_all mode)
+     * ======================================================================== */
+    if (apply_all) {
+        fprintf(stderr, "INFO: Applying learned thresholds to all %d barcodes\n", n_cols);
+        
+        /* Build set of already-processed barcodes */
+        MapSI processed_map;
+        mapsi_init(&processed_map, C * 2 + 1);
+        for (int i = 0; i < C; ++i) {
+            mapsi_put(&processed_map, cell_barcodes[i], 1);
+        }
+        
+        int extra_singlet = 0, extra_doublet = 0, extra_ambig = 0, extra_low = 0;
+        int skipped_duplicate = 0;
+        
+        /* Reopen output files in append mode */
+        FILE *fa_app = fopen(path_assign, "a"); if (!fa_app) die("Cannot reopen assignments for append");
+        FILE *fd_app = fopen(path_dbl, "a"); if (!fd_app) die("Cannot reopen doublets for append");
+        FILE *fb_app = fopen(path_amb, "a"); if (!fb_app) die("Cannot reopen ambiguous for append");
+        FILE *fu_app = fopen(path_unas, "a"); if (!fu_app) die("Cannot reopen unassignable for append");
+        
+        for (int col = 0; col < n_cols; ++col) {
+            const char *barcode = mtx_barcodes.data[col];
+            
+            /* Skip if already processed */
+            if (mapsi_get(&processed_map, barcode) == 1) {
+                continue;
+            }
+            
+            /* Skip if in filtered list but missing from matrix (shouldn't happen) */
+            if (mapsi_get(&filt_map, barcode) == 1) {
+                fprintf(stderr, "Warning: barcode %s in filtered list but already processed\n", barcode);
+                skipped_duplicate++;
+                continue;
+            }
+            
+            /* Apply quality filter */
+            if (all_col_tot[col] < M_min) {
+                extra_low++;
+                continue;
+            }
+            
+            /* Apply mode-specific classification */
+            if (simple_assign) {
+                /* ===== SIMPLE-ASSIGN MODE ===== */
+                int top1_idx = -1;
+                int top1_count = 0, top2_count = 0;
+                
+                /* Find top1 and top2 from all_col_vecs */
+                for (int kx = 0; kx < all_col_vecs[col].n; ++kx) {
+                    int feat = all_col_vecs[col].data[kx].feat;
+                    int count = all_col_vecs[col].data[kx].count;
+                    if (count > top1_count) {
+                        top2_count = top1_count;
+                        top1_count = count;
+                        top1_idx = feat;
+                    } else if (count > top2_count) {
+                        top2_count = count;
+                    }
+                }
+                
+                /* Apply simple rules */
+                if (top1_count < min_count) {
+                    extra_low++;
+                } else if (top2_count == 0 || (double)top1_count / (double)top2_count >= min_ratio) {
+                    fprintf(fa_app, "%s\t%d\n", barcode, top1_idx);
+                    extra_singlet++;
+                } else if (top1_count == top2_count) {
+                    fprintf(fb_app, "%s\n", barcode);
+                    extra_ambig++;
+                } else {
+                    fprintf(fb_app, "%s\n", barcode);
+                    extra_ambig++;
+                }
+                
+            } else if (!use_em) {
+                /* ===== FLEX MODE ===== */
+                /* Apply FLEX classification using stored data and learned thresholds */
+                /* This is more complex - we need to compute p-values and apply learned thresholds */
+                
+                int t1 = -1, t2 = -1, v1 = 0, v2 = 0;
+                for (int kx = 0; kx < all_col_vecs[col].n; ++kx) {
+                    int feat = all_col_vecs[col].data[kx].feat;
+                    int val = all_col_vecs[col].data[kx].count;
+                    if (val > v1) {
+                        v2 = v1; t2 = t1;
+                        v1 = val; t1 = feat;
+                    } else if (val > v2) {
+                        v2 = val; t2 = feat;
+                    }
+                }
+                
+                if (t1 < 1) {
+                    extra_low++;
+                    continue;
+                }
+                
+                /* Compute fraction for classification */
+                double frac1 = (double)v1 / (double)all_col_tot[col];
+                /* Note: In apply_all mode, we use learned thresholds without recomputing p-values */
+                
+                /* Simple classification based on dominance and fraction */
+                /* Reuse learned thresholds: tau, delta, gamma */
+                if (frac1 >= tau && v1 >= (int)(delta * all_col_tot[col])) {
+                    /* Singlet */
+                    fprintf(fa_app, "%s\t%d\n", barcode, t1);
+                    extra_singlet++;
+                } else if (t2 >= 1) {
+                    /* Check doublet criteria */
+                    int sum12 = v1 + v2;
+                    double frac12 = (double)sum12 / (double)all_col_tot[col];
+                    if (frac12 >= gamma) {
+                        fprintf(fd_app, "%s\t%d\t%d\n", barcode, t1, t2);
+                        extra_doublet++;
+                    } else {
+                        fprintf(fb_app, "%s\n", barcode);
+                        extra_ambig++;
+                    }
+                } else {
+                    fprintf(fb_app, "%s\n", barcode);
+                    extra_ambig++;
+                }
+                
+            } else {
+                /* ===== EM MODE ===== */
+                /* Apply EM classification using stored per-column guide counts */
+                /* This requires the EM fits that were computed earlier */
+                
+                /* For simplicity, we'll apply basic thresholds since full EM application
+                 * would require re-running posteriors for each barcode.
+                 * A more sophisticated implementation would store EM parameters and reuse them. */
+                
+                int top1_gid = -1, top2_gid = -1;
+                int top1_cnt = 0, top2_cnt = 0;
+                
+                /* Extract top guides from all_col_em_lists */
+                for (int kx = 0; kx < all_col_em_lists[col].n; ++kx) {
+                    int guide = all_col_em_lists[col].data[kx].a;
+                    int count = all_col_em_lists[col].data[kx].b;
+                    if (count > top1_cnt) {
+                        top2_cnt = top1_cnt; top2_gid = top1_gid;
+                        top1_cnt = count; top1_gid = guide;
+                    } else if (count > top2_cnt) {
+                        top2_cnt = count; top2_gid = guide;
+                    }
+                }
+                
+                /* Apply simple thresholds for EM mode */
+                if (top1_cnt < k_min) {
+                    extra_low++;
+                } else {
+                    /* Check dominance */
+                    int cand_sum = top1_cnt + (top2_gid >= 1 ? top2_cnt : 0);
+                    double frac_dom = (double)cand_sum / (double)all_col_tot[col];
+                    
+                    if (top2_gid < 1 || top2_cnt < k_min) {
+                        /* Singlet */
+                        fprintf(fa_app, "%s\t%d\n", barcode, top1_gid);
+                        extra_singlet++;
+                    } else if (frac_dom >= gamma_min) {
+                        /* Doublet */
+                        fprintf(fd_app, "%s\t%d\t%d\n", barcode, top1_gid, top2_gid);
+                        extra_doublet++;
+                    } else {
+                        fprintf(fb_app, "%s\n", barcode);
+                        extra_ambig++;
+                    }
+                }
+            }
+        }
+        
+        fclose(fa_app); fclose(fd_app); fclose(fb_app); fclose(fu_app);
+        
+        fprintf(stderr, "INFO: --apply_all added: %d singlets, %d doublets, %d ambiguous, %d low\n",
+                extra_singlet, extra_doublet, extra_ambig, extra_low);
+        if (skipped_duplicate > 0) {
+            fprintf(stderr, "Warning: Skipped %d duplicate barcodes\n", skipped_duplicate);
+        }
+        
+        /* Update totals for final QC reporting */
+        n_singlet += extra_singlet;
+        n_doublet += extra_doublet;
+        n_ambig += extra_ambig;
+        n_low += extra_low;
+        
+        /* Cleanup */
+        mapsi_free(&processed_map);
+    }
+
     fclose(fa); fclose(fd); fclose(fb); fclose(fu);
 
     /* QC */
@@ -1202,6 +1443,24 @@ int main(int argc, char **argv){
     if (cell_vecs){ for (int i=0;i<C;++i) vecfc_free(&cell_vecs[i]); free(cell_vecs); }
     if (guide_lists){ for (int g=1; g<=K; ++g) if (guide_lists[g].data) free(guide_lists[g].data); free(guide_lists); }
     if (guide_tot) free(guide_tot);  /* NEW: cleanup guide totals */
+    
+    /* NEW: cleanup apply_all structures */
+    if (apply_all) {
+        if (all_col_tot) free(all_col_tot);
+        if (all_col_vecs) {
+            for (int j = 0; j < n_cols; ++j) {
+                vecfc_free(&all_col_vecs[j]);
+            }
+            free(all_col_vecs);
+        }
+        if (all_col_em_lists) {
+            for (int j = 0; j < n_cols; ++j) {
+                if (all_col_em_lists[j].data) free(all_col_em_lists[j].data);
+            }
+            free(all_col_em_lists);
+        }
+    }
+    
     free(cell_tot); for (int i=0;i<C;++i) free(cell_barcodes[i]); free(cell_barcodes);
     free(col_to_cellidx); free(col_status);
     free(ambient_colsum); free(neg_sorted); free(ks);

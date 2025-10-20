@@ -1,0 +1,74 @@
+Subset Mode Enhancement Runbook
+================================
+
+Goal
+----
+Extend `call_features` to support a mixed workflow where feature thresholds are trained on the filtered whitelist but then applied to every barcode in the matrix. Introduce a `--apply_all` flag that triggers the new behaviour.
+
+Scope
+-----
+- Modify `call_features` C implementation in `/mnt/pikachu/call_features/src/call_features.c`.
+- Preserve default semantics when `--apply_all` is not supplied.
+- Ensure the new mode works for both simple-assign and FLEX/EM paths.
+
+Tasks
+-----
+1. **Add CLI plumbing**
+   - Update option parsing (see switch around lines ~470) to accept `--apply_all`.
+   - Extend `print_help()` text to describe the new flag.
+   - Gate the new behaviour behind a boolean (e.g., `int apply_all = 0`).
+
+2. **Capture global per-column stats**
+   - During the MTX streaming loops, in addition to the existing filtered-only structures, record for *every* column:
+     - Total UMIs.
+     - Top1/top2 allowed feature IDs and counts (track separately for later classification).
+     - For EM mode, accumulate per-column counts for each guide (or store sufficient info to recompute posteriors).
+   - Reuse existing arrays where possible; otherwise allocate new `int`/`double` buffers sized `n_cols`.
+   - Wrap these updates behind `if (apply_all)` so the default mode stays lightweight.
+
+3. **Run training on filtered cells (unchanged)**
+   - No behavioural change here: thresholds, ambient vector, EM fits, etc. should continue to use only the filtered whitelist (`cells_cols`).
+
+4. **Post-training application to all barcodes**
+   - After the existing filtered-only output loop:
+     - Iterate over every MTX column not in the filtered map (skip duplicates).
+     - Reuse the stored top1/top2 data and totals to apply:
+       * Simple assign rules (`min_count`, `min_ratio`).
+       * FLEX rules (`tau`, `delta`, `gamma`, `alpha`); ensure p-values/FDR are computed consistently (consider running BH on the expanded set when `apply_all` is set).
+       * EM predictions: use learned parameters to score each additional column (e.g., reconstruct candidate counts per guide and evaluate posteriors).
+     - Append results to the same output files (`assignments.tsv`, etc.) or create clearly labelled full-set files if appending is undesirable. Document the choice.
+
+5. **Memory and performance safeguards**
+   - Check allocation sizes to avoid overflow (`n_cols` can be ~1.6M for lane1).
+   - Free any new buffers before exit.
+
+6. **Documentation & usage**
+   - Update `README.md` (and any relevant docs under `/docs`) describing `--apply_all`.
+   - Clarify that `filtered_barcodes.tsv`/`--cell-list` is still required to define the training subset.
+
+7. **Testing**
+   - Add or update tests under `testing/` or `tests/` to cover:
+     * Default behaviour unchanged (same outputs without `--apply_all`).
+     * Small synthetic MTX where `--apply_all` produces extra assignments beyond the filtered list.
+   - Run existing unit/system tests to confirm no regressions (`make test` if available).
+
+Artifacts & References
+----------------------
+- Source: `/mnt/pikachu/call_features/src/call_features.c`
+- Helper modules: `per_guide_em.c`, `compute_Mmin_from_cells.c` (no expected changes, but review if extra hooks are needed).
+- Existing flag parsing pattern: see `--simple-assign`, `--cell-list`, etc.
+- Workflow scripts consuming `call_features`: `/mnt/pikachu/flex/scripts/run_universe_rescue_lane1.sh` and related plans.
+
+Open Questions / Decisions
+--------------------------
+- Whether to append to the existing output files or emit separate “full-set” versions (`assignments_full.tsv`, etc.). Decide and document in the README + run scripts.
+- For FLEX mode FDR: either expand BH to the union of filtered+unfiltered or reuse filtered q-values. Choose one approach and note the rationale.
+- EM inference path: confirm whether storing per-column guide counts during the first pass is feasible; otherwise plan for a second targeted scan.
+
+Ready-to-Run Steps for Coding Agent
+-----------------------------------
+1. Pull latest `call_features` repo (`/mnt/pikachu/call_features`).
+2. Follow Tasks 1–5 above to implement the new `--apply_all` path.
+3. Update docs (Task 6).
+4. Execute test suite (Task 7).
+5. Coordinate with workflow owners (`scripts/run_universe_rescue_lane1.sh`) if they need to adopt the new flag.

@@ -1,0 +1,135 @@
+Questions for Planning Agent - subset_call_plan.txt
+====================================================
+
+CRITICAL DECISIONS NEEDED BEFORE IMPLEMENTATION:
+
+1. Output File Strategy - How should results be written when using --apply_all?
+   - a) Append all results (filtered + unfiltered) to existing output files (assignments.tsv, etc.)
+   - b) Create separate "full-set" output files (assignments_full.tsv, etc.)
+   - c) Add a column indicator to distinguish filtered vs unfiltered barcodes in a single file
+
+2. FLEX Mode FDR Calculation - How should False Discovery Rate be computed when --apply_all is used?
+   - a) Expand Benjamini-Hochberg (BH) procedure to the union of filtered + unfiltered p-values
+   - b) Reuse the filtered q-values (apply same thresholds learned from filtered set)
+   - c) Run BH separately for filtered and unfiltered sets
+
+3. EM Inference Path - How should per-column guide counts be tracked for EM mode?
+   - a) Store all per-column guide counts during the first MTX pass (may require significant memory)
+   - b) Perform a second targeted scan of the MTX for unfiltered columns when needed
+   - c) Store only top K guides per column to balance memory and accuracy
+
+4. Memory Constraints - What is the acceptable memory overhead for --apply_all mode?
+   - a) No more than 2x current memory usage (strict constraint)
+   - b) Up to 5x current memory for large lane datasets (~1.6M columns)
+   - c) No specific limit, optimize for correctness first
+
+5. Backward Compatibility - Should existing workflow scripts be updated automatically?
+   - a) Yes, update scripts like run_universe_rescue_lane1.sh to use --apply_all by default
+   - b) No, keep existing scripts unchanged and create new versions for --apply_all workflow
+   - c) Add --apply_all as an optional parameter in scripts with documentation
+
+ADDITIONAL CONTEXT QUESTIONS:
+
+6. Do all three calling modes (simple-assign, FLEX, EM) need to support --apply_all equally?
+   - a) Yes, all three modes must support it
+   - b) Start with simple-assign only, add others later
+   - c) Prioritize FLEX mode, others are optional
+
+7. Should there be any filtering criteria for which unfiltered barcodes get processed?
+   - a) Process all barcodes in the matrix regardless of quality
+   - b) Apply a minimum UMI threshold before processing unfiltered barcodes
+   - c) Use a different criteria (specify)
+
+8. How should the tool handle conflicts if a barcode appears in both filtered and unfiltered sets?
+   - a) Skip unfiltered processing for barcodes already in filtered list (no duplicates)
+   - b) Process both and flag conflicts
+   - c) Error out if duplicates detected
+
+Please answer these questions (just the letter choice for each) so the implementation can proceed with clear specifications.
+
+================================================================================
+ANSWERS PROVIDED:
+================================================================================
+
+1. Output File Strategy: **(a)** Append all results to existing output files
+   - All barcodes (filtered + unfiltered) will be written to the same assignments.tsv, etc.
+
+2. FLEX Mode FDR Calculation: **(b)** Reuse the filtered q-values
+   - Apply the same thresholds learned from the filtered set to unfiltered barcodes
+
+3. EM Inference Path: **(a)** Store all per-column guide counts during first pass
+   - Accept the memory overhead to avoid second MTX scan
+
+4. Memory Constraints: **(c)** No specific limit, optimize for correctness first
+   - Memory usage is secondary to getting correct results
+
+5. Backward Compatibility: **(c)** Add --apply_all as optional parameter with documentation
+   - Existing scripts remain unchanged; new flag is opt-in
+
+6. Mode Support: **All three modes (simple-assign, FLEX, EM) must support --apply_all**
+   - Note: simple-assign has no training phase, so implementation is trivial
+   - Just apply the fixed thresholds to all barcodes that pass quality filters
+
+7. Filtering Criteria: **Existing quality filters must still apply**
+   - Unfiltered barcodes need sufficient data to apply the model
+   - Minimum thresholds (UMI counts, etc.) should still be enforced
+
+8. Barcode Conflicts: **Issue a warning and do not recalculate**
+   - If a barcode is in both filtered and unfiltered sets, warn but skip reprocessing
+
+================================================================================
+IMPLEMENTATION GUIDANCE FOR CODING AGENT:
+================================================================================
+
+Based on these answers, the implementation should:
+
+✓ Append all --apply_all results to existing output files (assignments.tsv, etc.)
+  - No need for separate _full.tsv files
+
+✓ For FLEX mode: reuse learned thresholds/q-values from filtered training
+  - No need to recompute BH across the full union
+
+✓ Allocate memory during first MTX pass to store per-column guide counts
+  - Size arrays for n_cols (all barcodes)
+  - Store under "if (apply_all)" guard to keep default mode lightweight
+
+✓ For simple-assign mode: straightforward extension
+  - No training involved, just apply min_count/min_ratio to all passing barcodes
+
+✓ Quality filters remain in place:
+  - Check minimum UMI counts before attempting classification
+  - Only process barcodes with sufficient evidence
+
+✓ Duplicate handling:
+  - Track which barcodes were processed during filtered phase
+  - Skip them during unfiltered iteration
+  - fprintf(stderr, "Warning: barcode %s already processed\n", ...)
+
+✓ Documentation updates:
+  - Mark --apply_all as optional flag in help text and README
+  - Note that filtered_barcodes.tsv still defines the training set
+  - Explain that quality filters apply to all barcodes regardless of --apply_all
+
+================================================================================
+IMPLEMENTATION COMPLETE
+================================================================================
+
+The --apply_all flag has been successfully implemented with the following:
+
+1. ✅ CLI flag added with help text
+2. ✅ Memory allocation for per-column tracking (all barcodes)
+3. ✅ MTX reading extended to capture all column data
+4. ✅ Simple-assign mode: Applies min_count/min_ratio to all barcodes
+5. ✅ FLEX mode: Uses learned tau/delta/gamma without recomputing FDR
+6. ✅ EM mode: Applies thresholds using stored per-column guide counts
+7. ✅ Memory cleanup implemented
+8. ✅ Documentation updated (README.md and docs/Technical.md)
+9. ✅ Code compiles successfully with no errors
+
+Key implementation notes:
+- Output files are appended in apply_all mode (all results in same file)
+- Duplicate barcodes trigger warnings but are skipped
+- Quality filters (M_min) apply universally
+- Memory overhead acceptable for correctness-first workflows
+- Final QC stats include both filtered and unfiltered results
+

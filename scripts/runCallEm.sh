@@ -9,8 +9,8 @@ SC_ID="SC2300771"
 
 
 # REQUIRED paths
-MTX_DIR="/storage/scRNAseq_output/Alignments/${SC_ID}/star/demux"
-OUT_PREFIX="/storage/scRNAseq_output/Alignments/${SC_ID}/star/features/"
+MTX_DIR="/storage/${SC_ID}_prod/demux"
+OUT_PREFIX="/storage/${SC_ID}_prod/features/"
 
 # OPTIONAL paths (set to empty string to disable)
 #STARSOLO_DIR="/storage/scRNAseq_output/Alignments/${SC_ID}/star/Solo.out/Gene"
@@ -25,7 +25,7 @@ FLOOR="12"         # --floor
 AMBIENT_Q="0.999"  # --ambient-q
 USE_FDR=true       # set to false to append --no-fdr
 
-CELL_LIST="/storage/scRNAseq_output/Alignments/${SC_ID}/star/non_empty_barcodes.txt"
+CELL_LIST="/storage/SC2300771_prod/counts_rerun/SC2300771_barcodes.tsv"
 
 # -------- EM-specific knobs (streams binary only) --------
 TAU_POS="0.85"     # positive-posterior threshold per guide

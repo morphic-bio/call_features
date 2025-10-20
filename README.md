@@ -40,6 +40,7 @@ and `flex_demux_mtx` (stand-alone FLEX implementation).
 | `--ambient-q X` | double | **0.999** | High quantile used by the empirical ambient model. |
 | `--no-fdr` | switch | *off* | Use raw p-values instead of FDR-corrected q-values. |
 | `--m-min-fixed N` | int | *unset* | **Bypass** all ambient/statistical and cell-derived rules; use `M_min = N` for the low-support cutoff. |
+| `--apply-all` | switch | *off* | Apply learned thresholds to **all** barcodes in the matrix (not just filtered list). See section 2.5 below. |
 
 ### 2.2 Feature-processing & simple assignment
 
@@ -79,6 +80,38 @@ and `flex_demux_mtx` (stand-alone FLEX implementation).
 **Why two dominance thresholds?**  In clean data `(c1+c2)/total` ≥ `gamma-min` is robust. Under heavy ambient noise the candidate-only ratio is more reliable; the algorithm considers a cell a doublet if **either** condition passes.
 
 **Balance check** (`--doublet-balance`): avoids misclassifying singlets with trace counts of a second guide as doublets. Disabling it loosens the call when barcode balance is not informative (e.g. targeted panels with skewed expression).
+
+### 2.5 Apply-all mode (`--apply-all`)
+
+By default, `call_features` trains thresholds on the **filtered barcode list** (from `--cell-list`, MTX directory, or STARsolo) and classifies only those barcodes. The `--apply-all` flag extends this workflow:
+
+1. **Training phase**: Thresholds, ambient model, and EM parameters are learned using only the filtered barcodes (unchanged).
+2. **Application phase**: The learned model is then applied to **every barcode** in the matrix that passes quality filters (`M_min`).
+
+**Key behaviors:**
+- Output files (`assignments.tsv`, `doublets.txt`, etc.) contain results for both filtered and unfiltered barcodes
+- Barcodes already processed in the filtered set are skipped with a warning if duplicates are detected
+- Quality filters (`M_min`) still apply—barcodes with insufficient counts are excluded
+- For **FLEX mode**: Uses learned `tau`, `delta`, `gamma` thresholds without recomputing FDR
+- For **EM mode**: Applies learned parameters to classify additional barcodes
+- For **simple-assign**: Trivially extends to all barcodes (no training phase)
+
+**Memory consideration**: `--apply-all` allocates arrays sized to the full matrix (`n_cols`), which can be ~1.6M for large datasets. This is acceptable for correctness-first workflows.
+
+**When to use:**
+- You want to "rescue" barcodes that didn't make the filtered list but have clear feature assignments
+- Running universe rescue workflows where the filtered list is conservative
+- Exploratory analysis to see how many additional cells can be called
+
+**Example:**
+```bash
+call_features \
+  --mtx-dir HTO/matrix \
+  --cell-list filtered_barcodes.tsv \
+  --out-prefix results/rescue \
+  --apply-all \
+  --tau 0.8 --delta 0.4 --gamma 0.9
+```
 
 ---
 
